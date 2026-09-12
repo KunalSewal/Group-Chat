@@ -73,6 +73,27 @@ const PEERS = String(process.env.PEERS || '')
   .map((entry) => entry.trim())
   .filter(Boolean);
 
+// Node's default is to kill the process on a promise nobody handled. That
+// default is right for a script and wrong for a server that is one of three:
+// a single stray rejection — a peer that went away mid-replication, a socket
+// that closed during a write — would take down a backend that is otherwise
+// serving every request correctly, along with every request in flight on it.
+// It is logged loudly instead, because it is still a bug worth finding.
+process.on('unhandledRejection', (reason) => {
+  const detail = reason instanceof Error ? reason.stack : String(reason);
+  console.error('unhandled rejection (continuing):', detail);
+});
+
+// An uncaught exception is different: the stack that threw was abandoned
+// wherever it was, so this process's state may no longer be one its own code
+// would produce. Serving from it risks answering wrongly, which is worse than
+// not answering — so it logs and leaves, and the supervisor starts a clean one
+// within the second. See deploy/supervise.sh.
+process.on('uncaughtException', (err) => {
+  console.error('uncaught exception, exiting for a clean restart:', err.stack || err);
+  process.exit(1);
+});
+
 async function start() {
   // Check the encryption key before anything else. A missing or malformed key
   // only shows up when the first message is sent otherwise, by which point
