@@ -118,9 +118,46 @@ function clamp(value) {
   return Math.max(0, Math.min(100, value));
 }
 
+// What the container is actually using, and what it is actually allowed.
+//
+// os.totalmem()/freemem() describe the host (128GB here) while the cgroup
+// enforces 512MB, so the only numbers that predict an OOM kill are these. They
+// cover everything in the container — this process, mongod, page cache — which
+// is the point: the process that gets killed is chosen by the total, not by any
+// one runtime's own accounting.
+function containerMemory() {
+  const read = (p) => {
+    try {
+      return Number(fs.readFileSync(p, 'utf8').trim());
+    } catch {
+      return null;
+    }
+  };
+
+  const current = read('/sys/fs/cgroup/memory.current');
+  const rawMax = (() => {
+    try {
+      return fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+    } catch {
+      return null;
+    }
+  })();
+  if (current === null || rawMax === null || rawMax === 'max') return null;
+
+  const max = Number(rawMax);
+  if (!Number.isFinite(max) || max <= 0) return null;
+
+  return {
+    usedMb: Math.round(current / 1048576),
+    limitMb: Math.round(max / 1048576),
+    usedPercent: Number(((100 * current) / max).toFixed(1)),
+  };
+}
+
 function getStats(extra = {}) {
   const totalMem = os.totalmem();
   const freeMem = os.freemem();
+  const container = containerMemory();
 
   return {
     hostname: os.hostname(),
@@ -136,9 +173,19 @@ function getStats(extra = {}) {
     memUsedPercent: Number((100 * (1 - freeMem / totalMem)).toFixed(2)),
     memTotalMb: Math.round(totalMem / 1024 / 1024),
     heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    // The number that predicts an OOM kill. null outside a container.
+    container,
     uptimeSeconds: Math.round(process.uptime()),
     ...extra,
   };
+}
+
+// Fraction of the container's memory budget in use, 0-1, or null if unknown.
+// The store consults this to shed memory before the kernel does it for us.
+function memoryPressure() {
+  const container = containerMemory();
+  return container ? container.usedPercent / 100 : null;
 }
 
 function startSampling(intervalMs = 500) {
@@ -147,4 +194,4 @@ function startSampling(intervalMs = 500) {
   return timer;
 }
 
-module.exports = { getStats, startSampling, sample, quotaCores };
+module.exports = { getStats, startSampling, sample, quotaCores, memoryPressure, containerMemory };

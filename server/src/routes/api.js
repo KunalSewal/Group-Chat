@@ -129,6 +129,7 @@ function createApiRouter({ store, replicator, tracker, reconciler = null }) {
         res.setHeader('Content-Encoding', payload.encoding);
       }
       res.setHeader('Content-Length', String(payload.body.length));
+      res.on('close', payload.release);
       res.end(payload.body);
     } catch (err) {
       tracker.errors += 1;

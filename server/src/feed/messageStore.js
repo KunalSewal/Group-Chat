@@ -3,6 +3,7 @@ const zlib = require('node:zlib');
 
 const { encrypt, decrypt } = require('../crypto/messageCipher');
 const { toBuffer, COLLECTION } = require('../db/messageRepository');
+const { memoryPressure } = require('../systemStats');
 
 // The store behind /message and /feed.
 //
@@ -33,6 +34,15 @@ const DEFAULTS = {
   // sees its whole conversation. Bounded so that a machine which has been up
   // through many runs does not eventually try to serialise a 100MB response.
   maxMessages: Number(process.env.FEED_MAX_MESSAGES || 30000),
+  // The cap that actually bounds memory. maxMessages bounds how much work a
+  // rebuild does, but not how much it allocates: the size of a message is the
+  // client's choice, and the same thirty thousand messages measured 7.4MB one
+  // day and 12.5MB the next. The feed buffers are the largest allocation in
+  // this process — the live body, four snapshots, the gzip copy — and they are
+  // sized in bytes, so the cap that keeps a 512MB container alive has to be
+  // expressed in bytes too. 16MB of serialised feed works out to roughly 100MB
+  // of buffers, which leaves the database its share.
+  maxBytes: Number(process.env.FEED_MAX_BYTES || 16 * 1024 * 1024),
   // How long a write may wait to be batched with its neighbours.
   flushMs: Number(process.env.WRITE_FLUSH_MS || 0),
   flushMax: Number(process.env.WRITE_FLUSH_MAX || 250),
@@ -48,6 +58,12 @@ const DEFAULTS = {
   pollLookbackMs: Number(process.env.FEED_POLL_LOOKBACK_MS || 3000),
   // Only needed when sibling worker processes share this database.
   pollEnabled: false,
+  // Fraction of the container's memory budget at which this process starts
+  // giving memory back, and the fraction at which it starts giving up
+  // conversation to do it.
+  shedAt: Number(process.env.FEED_SHED_AT || 0.80),
+  shedHardAt: Number(process.env.FEED_SHED_HARD_AT || 0.90),
+  memoryCheckMs: Number(process.env.FEED_MEMORY_CHECK_MS || 2000),
 };
 
 class MessageStore extends EventEmitter {
@@ -75,12 +91,18 @@ class MessageStore extends EventEmitter {
     this.checksum = 0;
     this.lastRebuildMs = 0;
     this.snapshots = new Array(SNAPSHOT_BUFFERS).fill(null);
-    this.snapshotSlot = 0;
+    this.snapshotSkips = 0;
+    this.shedding = false;
+    this.snapshotRotation = 0;
     // How far past the cap the conversation may grow before it is trimmed.
     // Larger slack means the costly re-lay happens proportionally less often.
     this.trimSlack = Math.max(1000, Math.floor(this.options.maxMessages * 0.1));
+    // Trimming re-lays the whole body, so it is worth doing in batches; a
+    // tenth of the cap is a batch large enough that it is rare and small
+    // enough that it does not become the cap.
+    this.byteSlack = Math.max(65536, Math.floor(this.options.maxBytes * 0.1));
 
-    this.cache = { plain: Buffer.from('[]'), gzip: null, count: 0, builtAt: 0 };
+    this.cache = { plain: Buffer.from('[]'), plainEntry: null, gzip: null, count: 0, builtAt: 0 };
     this.dirty = true;
     this.building = false;
 
@@ -168,6 +190,10 @@ class MessageStore extends EventEmitter {
   stats() {
     return {
       messages: this.messages.length,
+      bodyBytes: this.bodyLen,
+      bodyCapacity: this.body.length,
+      maxBytes: this.options.maxBytes,
+      shedding: Boolean(this.shedding),
       feedBytes: this.cache.plain.length,
       feedGzipBytes: this.cache.gzip ? this.cache.gzip.length : 0,
       pendingWrites: this.pendingWrites.length,
@@ -311,22 +337,58 @@ class MessageStore extends EventEmitter {
     return added;
   }
 
-  // Hands back one of a fixed set of buffers, grown in place when the feed
-  // outgrows them, so the steady state allocates nothing. Returns a view of
-  // exactly the requested length.
+  // Hands back a pooled buffer that nothing is currently reading from.
+  //
+  // Pooling these is what stopped the per-rebuild allocation from exhausting
+  // the container, but it introduced a subtler hazard: res.end(buffer) does not
+  // copy, it hands the buffer to the socket and writes it asynchronously. A
+  // buffer reused while a slow client is still being written to would corrupt
+  // that response — and under load responses regularly outlive several rebuild
+  // intervals, so this was reachable, not theoretical.
+  //
+  // So each buffer carries a reference count: one held by whichever snapshot is
+  // currently cached, plus one per response still writing from it. A buffer is
+  // only reused once that reaches zero. If every buffer is busy the rebuild is
+  // skipped rather than forced — the cache simply stays one interval staler,
+  // which is invisible, where a corrupted feed would not be.
   takeSnapshotBuffer(size) {
-    const slot = this.snapshotSlot % SNAPSHOT_BUFFERS;
-    this.snapshotSlot += 1;
+    const free = (entry) => entry && entry.refs === 0;
 
-    let buffer = this.snapshots[slot];
-    if (!buffer || buffer.length < size) {
-      // Grow with headroom so a steadily growing feed does not reallocate on
-      // every single rebuild.
-      buffer = Buffer.allocUnsafe(Math.max(size * 2, 64 * 1024));
-      this.snapshots[slot] = buffer;
+    let slot = this.snapshots.findIndex((e) => free(e) && e.buf.length >= size);
+    if (slot === -1) slot = this.snapshots.findIndex(free);
+    if (slot === -1) slot = this.snapshots.findIndex((e) => !e);
+
+    if (slot === -1) {
+      // Every buffer still has a reader. Skipping a rebuild is the cheap and
+      // safe answer to that. But a response that never emitted its close
+      // event would pin a buffer for good, and a feed that silently stops
+      // updating is a failure this application has already had once. So after
+      // a few consecutive skips, drop the next entry out of the pool and
+      // allocate a replacement. Nothing is overwritten: the responses still
+      // writing hold their own reference to the old buffer, which is
+      // collected when they finish.
+      this.snapshotSkips += 1;
+      if (this.snapshotSkips < 3) return null;
+      slot = this.snapshotRotation % SNAPSHOT_BUFFERS;
+      this.snapshotRotation += 1;
+      this.snapshots[slot] = null;
     }
 
-    return buffer.subarray(0, size);
+    this.snapshotSkips = 0;
+
+    let entry = this.snapshots[slot];
+    if (!entry || entry.buf.length < size) {
+      // Grow with headroom so a steadily growing feed does not reallocate on
+      // every single rebuild.
+      // Headroom so a growing feed does not reallocate on every rebuild, but
+      // only a quarter of it once these are large: there are four of these, so
+      // doubling a 16MB snapshot costs 64MB of a 512MB container.
+      const headroom = size >= 8 * 1024 * 1024 ? Math.ceil(size * 1.25) : size * 2;
+      entry = { buf: Buffer.allocUnsafe(Math.max(headroom, 64 * 1024)), refs: 0 };
+      this.snapshots[slot] = entry;
+    }
+
+    return entry;
   }
 
   ensureCapacity(extra) {
@@ -334,8 +396,12 @@ class MessageStore extends EventEmitter {
     const needed = this.bodyLen + extra + 1;
     if (needed <= this.body.length) return;
 
-    let size = Math.max(this.body.length * 2, 64 * 1024);
-    while (size < needed) size *= 2;
+    // Doubling is right while the buffer is small — it keeps reallocation
+    // amortised — and wrong once it is large, where it can overshoot the cap by
+    // megabytes that are never used. Past 8MB it grows by a quarter instead.
+    const grow = (n) => (n >= 8 * 1024 * 1024 ? Math.ceil(n * 1.25) : n * 2);
+    let size = Math.max(grow(this.body.length), 64 * 1024);
+    while (size < needed) size = grow(size);
 
     const grown = Buffer.allocUnsafe(size);
     this.body.copy(grown, 0, 0, this.bodyLen);
@@ -386,15 +452,108 @@ class MessageStore extends EventEmitter {
     // messages is thirty thousand stringify calls and as many allocations, per
     // request. That is what killed the backends: the load itself was fine, the
     // conversation simply grew past the cap mid-run.
-    if (this.messages.length >= this.options.maxMessages + this.trimSlack) {
-      this.trim();
-    }
+    this.enforceCaps();
 
     this.dirty = true;
   }
 
-  trim() {
-    const excess = this.messages.length - this.options.maxMessages;
+  // Whichever cap binds first decides how much of the conversation is kept.
+  enforceCaps() {
+    const { maxMessages, maxBytes } = this.options;
+    let target = this.messages.length;
+
+    if (this.messages.length >= maxMessages + this.trimSlack) {
+      target = maxMessages;
+    }
+
+    if (this.bodyLen >= maxBytes + this.byteSlack && this.messages.length > 0) {
+      // No per-message byte offset is kept, so how many messages fit under the
+      // cap is estimated from the mean size. Exactness is not needed: the next
+      // append re-checks, and the slack means this runs rarely enough that a
+      // small overshoot costs nothing.
+      const mean = this.bodyLen / this.messages.length;
+      target = Math.min(target, Math.max(1, Math.floor(maxBytes / mean)));
+    }
+
+    if (target < this.messages.length) this.trim(target);
+  }
+
+  // How full the container's memory budget is, 0-1, or null when this is not
+  // running in one. Injectable so the shedding can be tested without a cgroup.
+  readPressure() {
+    const source = this.options.pressureSource || memoryPressure;
+    return source();
+  }
+
+  // Gives memory back before the kernel takes it.
+  //
+  // Everything in this container — this process, mongod, the page cache — is
+  // charged against one 512MB limit, and the kernel picks its victim by the
+  // total. It has picked this process before. A cap sized for the expected
+  // conversation does not help when the pressure comes from the database
+  // beside it, so this watches the only number that predicts the kill and
+  // responds to it directly.
+  //
+  // The order is deliberate: give back memory that costs nothing first, and
+  // only give up conversation once that is not enough. A shorter feed is a
+  // degraded answer; an OOM kill is no answer at all, and takes every message
+  // this process was holding with it.
+  relieveMemory(pressure) {
+    if (pressure === null || pressure < this.options.shedAt) {
+      // Coming out of it: the next rebuild has to be asked for, or the
+      // compressed copy would stay missing until the next message happened to
+      // arrive — and on a quiet backend that could be a long time.
+      if (this.shedding) this.dirty = true;
+      this.shedding = false;
+      return;
+    }
+
+    this.shedding = true;
+    this.counters.sheds = (this.counters.sheds || 0) + 1;
+
+    // 1. The pooled snapshots nobody is reading. They are the largest thing
+    //    here that can be released without losing anything: they are rebuilt
+    //    on demand, at the cost of one allocation.
+    let freed = 0;
+    for (let i = 0; i < this.snapshots.length; i += 1) {
+      const entry = this.snapshots[i];
+      if (entry && entry.refs === 0) {
+        freed += entry.buf.length;
+        this.snapshots[i] = null;
+      }
+    }
+
+    // 2. The compressed copy. It is a convenience — clients that asked for
+    //    gzip get the plain body instead until the pressure passes.
+    if (this.cache.gzip) {
+      freed += this.cache.gzip.length;
+      this.cache = { ...this.cache, gzip: null };
+    }
+
+    if (freed > 0) {
+      console.warn(
+        `memory pressure ${(pressure * 100).toFixed(0)}%: released ${Math.round(freed / 1048576)}MB of feed buffers`
+      );
+    }
+
+    if (pressure < this.options.shedHardAt) return;
+
+    // 3. Still close to the limit, so the conversation itself has to give. Half
+    //    at a time, and never below a floor: a feed that has been cut to
+    //    nothing is indistinguishable from a broken one.
+    const floor = Math.min(1000, this.messages.length);
+    const target = Math.max(floor, Math.floor(this.messages.length / 2));
+    if (target < this.messages.length) {
+      const before = this.messages.length;
+      this.trim(target);
+      console.warn(
+        `memory pressure ${(pressure * 100).toFixed(0)}%: trimmed feed from ${before} to ${this.messages.length} messages`
+      );
+    }
+  }
+
+  trim(target = this.options.maxMessages) {
+    const excess = this.messages.length - target;
     if (excess <= 0) return;
 
     for (let i = 0; i < excess; i++) {
@@ -405,9 +564,27 @@ class MessageStore extends EventEmitter {
 
     this.messages.splice(0, excess);
     // Removing from the front is the one case that cannot be done by appending,
-    // so the body is re-laid here. It happens only once the conversation passes
-    // maxMessages, not per message.
+    // so the body is re-laid here. It happens only once a cap is passed, not
+    // per message.
     this.rebuildBody();
+
+    // The buffer only ever grew. A burst of long messages could leave it many
+    // times the size of the conversation that is actually kept, and that memory
+    // is never handed back — which on a 512MB container is the difference
+    // between surviving a spike and being killed by the memory it left behind.
+    // The cached response still describes the untrimmed conversation, and
+    // nothing else here will mark it stale: trimming is the one change that
+    // does not go through an append. Until it is rebuilt, readers would keep
+    // being served the messages just dropped, and — when the trim was done to
+    // free memory — the buffer holding them would not be released either.
+    this.dirty = true;
+
+    const comfortable = Math.max(65536, Math.ceil(this.bodyLen * 1.5));
+    if (this.body.length > comfortable * 2) {
+      const shrunk = Buffer.allocUnsafe(comfortable);
+      this.body.copy(shrunk, 0, 0, this.bodyLen);
+      this.body = shrunk;
+    }
   }
 
   queueWrite(doc) {
@@ -526,9 +703,18 @@ class MessageStore extends EventEmitter {
     //
     // Rotating several deep means a buffer is not reused until well after any
     // response written from it has finished.
-    const plain = this.takeSnapshotBuffer(this.bodyLen + 1);
-    this.body.copy(plain, 0, 0, this.bodyLen);
-    plain[this.bodyLen] = 0x5d; // ']'
+    const entry = this.takeSnapshotBuffer(this.bodyLen + 1);
+    if (!entry) {
+      // Every pooled buffer still has a response reading from it. Skipping is
+      // correct: the cache stays one interval staler, which no reader can
+      // detect, where overwriting would corrupt a response already in flight.
+      this.building = false;
+      return;
+    }
+
+    this.body.copy(entry.buf, 0, 0, this.bodyLen);
+    entry.buf[this.bodyLen] = 0x5d; // ']'
+    const plain = entry.buf.subarray(0, this.bodyLen + 1);
 
     const count = this.messages.length;
     this.dirty = false;
@@ -536,13 +722,26 @@ class MessageStore extends EventEmitter {
     // Compression is the expensive half, so it is done asynchronously on the
     // threadpool at the fastest level: this payload is highly repetitive JSON,
     // where level 1 already gets most of the ratio for a fraction of the cost.
-    zlib.gzip(plain, { level: 1 }, (err, gzipped) => {
+    // While shedding, the compressed copy is skipped rather than built and
+    // thrown away: it is a second buffer and a threadpool job at exactly the
+    // moment the container can spare neither. Clients get the plain body.
+    const compress = this.shedding
+      ? (buf, opts, done) => done(null, null)
+      : zlib.gzip;
+
+    compress(plain, { level: 1 }, (err, gzipped) => {
+      // The cache holds a reference of its own, so the buffer it is pointing
+      // at is never handed back out for the next rebuild.
+      entry.refs += 1;
+      const previous = this.cache.plainEntry;
       this.cache = {
         plain,
+        plainEntry: entry,
         gzip: err ? null : gzipped,
         count,
         builtAt: Date.now(),
       };
+      if (previous) previous.refs -= 1;
       // What the whole rebuild cost, used to pace the next one so that
       // maintaining the cache cannot consume the machine as the feed grows.
       this.lastRebuildMs = Date.now() - startedAt;
@@ -552,20 +751,47 @@ class MessageStore extends EventEmitter {
 
   // The response for GET /feed. Returns pre-built bytes; the only per-request
   // work is choosing which of the two encodings to hand back.
+  // Returns the bytes for one /feed response, plus a release() the caller must
+  // invoke once the response has finished writing.
+  //
+  // Only the plain body needs releasing: it comes from the pooled buffers, so
+  // the pool has to know it is still being read. The gzip body is a fresh
+  // buffer from zlib each rebuild and is kept alive by the reference the
+  // response itself holds, so it needs no bookkeeping.
   feed({ acceptsGzip = false, limit = 0 } = {}) {
+    const noop = () => {};
+
     if (limit > 0 && limit < this.messages.length) {
       // Only our own load generator asks for a slice; build it on the spot
       // rather than keeping a second cache warm for a path the evaluation
       // never takes.
       const slice = this.messages.slice(-limit).map(serialise).join(',');
-      return { body: Buffer.from('[' + slice + ']'), encoding: null, count: limit };
+      return { body: Buffer.from('[' + slice + ']'), encoding: null, count: limit, release: noop };
     }
 
     if (acceptsGzip && this.cache.gzip) {
-      return { body: this.cache.gzip, encoding: 'gzip', count: this.cache.count };
+      return { body: this.cache.gzip, encoding: 'gzip', count: this.cache.count, release: noop };
     }
 
-    return { body: this.cache.plain, encoding: null, count: this.cache.count };
+    const entry = this.cache.plainEntry;
+    if (!entry) {
+      return { body: this.cache.plain, encoding: null, count: this.cache.count, release: noop };
+    }
+
+    entry.refs += 1;
+    let released = false;
+    return {
+      body: this.cache.plain,
+      encoding: null,
+      count: this.cache.count,
+      // Guarded: a response can emit both 'finish' and 'close', and double
+      // releasing would free a buffer another reader still holds.
+      release: () => {
+        if (released) return;
+        released = true;
+        entry.refs -= 1;
+      },
+    };
   }
 
   start() {
@@ -607,6 +833,21 @@ class MessageStore extends EventEmitter {
         setInterval(() => {
           this.poll().catch((err) => console.error('feed poll failed:', err.message));
         }, this.options.pollMs)
+      );
+    }
+
+    // Checked on its own timer rather than on the request path: under the load
+    // that causes the pressure, the request path is the last place that should
+    // be reading files.
+    if (this.options.memoryCheckMs > 0) {
+      timers.push(
+        setInterval(() => {
+          try {
+            this.relieveMemory(this.readPressure());
+          } catch (err) {
+            console.error('memory check failed:', err.message);
+          }
+        }, this.options.memoryCheckMs)
       );
     }
 

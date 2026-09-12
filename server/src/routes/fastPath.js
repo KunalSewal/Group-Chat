@@ -141,6 +141,10 @@ function createFastPath({ store, replicator, tracker }) {
       };
       if (payload.encoding) headers['content-encoding'] = payload.encoding;
 
+      // The pooled buffer must not be reused until the socket has finished
+      // with it; 'close' fires whether the response completed or the client
+      // went away mid-write.
+      res.on('close', payload.release);
       res.writeHead(200, headers);
       res.end(payload.body);
     } catch (err) {
