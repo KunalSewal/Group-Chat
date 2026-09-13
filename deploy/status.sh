@@ -38,3 +38,14 @@ echo
 echo
 echo "=== recent restarts ==="
 grep -h "exited with" "$LOG_DIR"/*.log 2>/dev/null | tail -5 || echo "(none logged)"
+
+# A restart count says a process is failing; only the last lines before it say
+# why, and that is the whole reason to look.
+for f in "$LOG_DIR"/*.log; do
+  [ -r "$f" ] || continue
+  if grep -q "FATAL|exited with" "$f" 2>/dev/null; then
+    echo
+    echo "--- $(basename "$f") (last 12 lines) ---"
+    tail -12 "$f"
+  fi
+done

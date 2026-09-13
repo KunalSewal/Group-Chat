@@ -80,6 +80,26 @@ curl http://<sys1>:<mapped port>/lb/status
 
 The lab maps each container's port 3000 to the host's *system port + 1000*.
 
+## When a machine will not come up
+
+Run `bash deploy/status.sh`; it prints the last lines of any log that recorded
+a failure, which is where the reason is.
+
+- **`backend exited with 9`** — node did not recognise a flag, which means the
+  supervisor found an older node than the interactive shell does. The scripts
+  source `~/.nvm/nvm.sh`, `~/.profile` and `~/.bashrc` to get the same one; if
+  node is installed somewhere none of those put on the PATH, the log now says
+  which node it used and what version.
+- **`mongo exited with 48`** — something already holds port 27017, almost
+  always an unsupervised `mongod --fork` left from an earlier session. Stop it
+  with `pkill -x mongod` and run `bash deploy/up.sh backend --restart`. Check
+  its `--dbpath` first: the supervised one uses `~/mongo-data`, so a forked one
+  on `/data/db` was writing somewhere else.
+- **`oom_kill` climbing during a run** — the container is out of memory. The
+  backend sheds its own buffers from 80% (`/stats` reports `shedding`), so a
+  kill above that usually means mongod, not the backend: lower
+  `MONGO_CACHE_GB`.
+
 ## Stopping
 
 ```bash
