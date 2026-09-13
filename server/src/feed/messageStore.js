@@ -50,6 +50,16 @@ const DEFAULTS = {
   // bound for readers, and the main CPU knob: rebuilding is the only
   // per-conversation work left in the read path.
   rebuildMs: Number(process.env.FEED_REBUILD_MS || 250),
+  // How hard to compress the cached feed. This is the one setting whose right
+  // value depends on something outside this machine: compression happens once
+  // per rebuild and is served to every request in that window, so a better
+  // ratio is close to free per request — but only worth paying for if the
+  // bytes are what the reader is waiting on. Measured here, a backend serves
+  // the feed at 517MB/s to another machine in the rack and 23MB/s to a laptop
+  // off-site, and on the same payload level 4 is 10% smaller than level 1 for
+  // 15ms more CPU per rebuild. Worth it across a slow link, wasted across a
+  // fast one, so it is a setting rather than a decision.
+  gzipLevel: Number(process.env.FEED_GZIP_LEVEL || 1),
   // How often we look for messages written by a peer machine or by another
   // worker process on this machine.
   pollMs: Number(process.env.FEED_POLL_MS || 150),
@@ -193,6 +203,7 @@ class MessageStore extends EventEmitter {
       bodyBytes: this.bodyLen,
       bodyCapacity: this.body.length,
       maxBytes: this.options.maxBytes,
+      gzipLevel: this.options.gzipLevel,
       shedding: Boolean(this.shedding),
       feedBytes: this.cache.plain.length,
       feedGzipBytes: this.cache.gzip ? this.cache.gzip.length : 0,
@@ -729,7 +740,7 @@ class MessageStore extends EventEmitter {
       ? (buf, opts, done) => done(null, null)
       : zlib.gzip;
 
-    compress(plain, { level: 1 }, (err, gzipped) => {
+    compress(plain, { level: this.options.gzipLevel }, (err, gzipped) => {
       // The cache holds a reference of its own, so the buffer it is pointing
       // at is never handed back out for the next rebuild.
       entry.refs += 1;
