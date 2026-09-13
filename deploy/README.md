@@ -40,27 +40,30 @@ On sys2, sys3, sys4:
 
 ```bash
 cd ~/csd-group-chat && git pull
-./deploy/up.sh backend
+bash deploy/up.sh backend
 ```
+
+Running them through `bash` rather than as `./deploy/up.sh` works whether or
+not the execute bit survived the trip to this machine.
 
 On sys1:
 
 ```bash
 cd ~/csd-group-chat && git pull
-BACKENDS=http://<sys2>:3000,http://<sys3>:3000,http://<sys4>:3000 ./deploy/up.sh lb
+BACKENDS=http://<sys2>:3000,http://<sys3>:3000,http://<sys4>:3000 bash deploy/up.sh lb
 ```
 
 `up.sh` is idempotent: a session already running is left alone. After pulling
 new code, replace it:
 
 ```bash
-./deploy/up.sh backend --restart
+bash deploy/up.sh backend --restart
 ```
 
 ## Checking
 
 ```bash
-./deploy/status.sh
+bash deploy/status.sh
 ```
 
 One screen: the tmux sessions, the container's memory against its limit,
@@ -80,8 +83,8 @@ The lab maps each container's port 3000 to the host's *system port + 1000*.
 ## Stopping
 
 ```bash
-./deploy/down.sh            # this machine's sessions
-./deploy/down.sh backend    # just one
+bash deploy/down.sh         # this machine's sessions
+bash deploy/down.sh backend # just one
 ```
 
 Killing the process does not stop it — the supervisor starts it again. The

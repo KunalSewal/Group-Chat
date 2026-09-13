@@ -36,7 +36,11 @@ start_session() {
   fi
 
   echo "[up] starting session '$session'"
-  tmux new-session -d -s "$session" "$here/supervise.sh" "$session" "$@"
+  # Invoked through bash rather than executed directly: the execute bit does
+  # not survive every route this repository takes to a machine, and a bring-up
+  # that fails on a file permission is a machine out of the pool for as long as
+  # it takes someone to notice why.
+  tmux new-session -d -s "$session" bash "$here/supervise.sh" "$session" bash "$@"
 }
 
 case "$role" in
