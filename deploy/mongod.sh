@@ -5,19 +5,33 @@ set -eu
 source "$(dirname "$0")/env.sh"
 mkdir -p "$MONGO_DBPATH"
 
-# An instance started outside this supervisor — a --fork left over from an
-# earlier session, most likely — still holds the port, and mongod's answer to
-# that is to exit 48 immediately. Supervised, that becomes a restart loop that
-# says "exited with 48" and nothing about the cause, while the machine looks
-# like it has a database because something is in fact listening on 27017.
-#
-# It is not enough to leave that one running: an unsupervised mongod is the
-# thing this deployment exists to stop having. Say plainly what to do about it.
-if (exec 3<>"/dev/tcp/$MONGO_BIND/$MONGO_PORT") 2>/dev/null; then
-  exec 3<&- 2>/dev/null || true
+# Wait for the port before deciding anything is wrong with it. Replacing a
+# session kills the old mongod and starts this one immediately, and the socket
+# is still held for a moment afterwards — that race produced an "exited with
+# 48" on every restart, which is noise in the one place the logs need to be
+# trustworthy.
+held=""
+for _ in $(seq 1 15); do
+  if (exec 3<>"/dev/tcp/$MONGO_BIND/$MONGO_PORT") 2>/dev/null; then
+    exec 3<&- 2>/dev/null || true
+    held="yes"
+    sleep 1
+  else
+    held=""
+    break
+  fi
+done
+
+# Still held after fifteen seconds: this is not a restart racing itself but an
+# instance started outside this supervisor — a --fork left from an earlier
+# session, most likely. It is worth naming, because the machine does not look
+# broken: something is listening on 27017, so the database appears to be up,
+# while the instance meant to be supervised restarts forever. And leaving that
+# one running is not an option either: an unsupervised mongod is the thing
+# this deployment exists to stop having.
+if [ -n "$held" ]; then
   echo "[mongod] FATAL: something already holds $MONGO_BIND:$MONGO_PORT, so this one cannot start."
-  echo "[mongod] It is almost certainly an unsupervised mongod from an earlier session:"
-  ps -o pid,etime,cmd -C mongod 2>/dev/null | sed 's/^/[mongod]   /' || true
+  ps -o pid,etime,cmd -C mongod 2>/dev/null | sed "s/^/[mongod]   /" || true
   echo "[mongod] Stop it and let the supervisor own it:  pkill -x mongod"
   echo "[mongod] Note its --dbpath first if the data there matters; this one uses $MONGO_DBPATH."
   exit 48

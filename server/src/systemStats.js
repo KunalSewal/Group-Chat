@@ -125,32 +125,68 @@ function clamp(value) {
 // cover everything in the container — this process, mongod, page cache — which
 // is the point: the process that gets killed is chosen by the total, not by any
 // one runtime's own accounting.
+// Everything the cgroup is charging this container, and how much of it the
+// kernel would actually have to kill something to reclaim.
+//
+// memory.current is not the working set. It includes the page cache — on these
+// machines, mongod's data files — which the kernel drops for free under
+// pressure. Measured on an idle backend with no messages stored, memory.current
+// read 392MB of 512MB, while the two processes together held about 234MB: the
+// rest was reclaimable cache. Treating that as pressure would have the backend
+// shedding buffers at idle, which costs throughput to relieve a shortage that
+// does not exist.
+//
+// So the figure that drives shedding subtracts what the kernel can take back
+// without killing anything: inactive file pages and reclaimable slab. What is
+// left is anonymous memory and kernel structures, which is what an OOM kill is
+// actually made of.
+function readMemoryStat() {
+  try {
+    const text = fs.readFileSync('/sys/fs/cgroup/memory.stat', 'utf8');
+    const out = {};
+    for (const line of text.split('\n')) {
+      const space = line.indexOf(' ');
+      if (space > 0) out[line.slice(0, space)] = Number(line.slice(space + 1));
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 function containerMemory() {
-  const read = (p) => {
+  const read = (path) => {
     try {
-      return Number(fs.readFileSync(p, 'utf8').trim());
+      return fs.readFileSync(path, 'utf8').trim();
     } catch {
       return null;
     }
   };
 
-  const current = read('/sys/fs/cgroup/memory.current');
-  const rawMax = (() => {
-    try {
-      return fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
-    } catch {
-      return null;
-    }
-  })();
-  if (current === null || rawMax === null || rawMax === 'max') return null;
+  const rawCurrent = read('/sys/fs/cgroup/memory.current');
+  const rawMax = read('/sys/fs/cgroup/memory.max');
+  if (rawCurrent === null || rawMax === null || rawMax === 'max') return null;
 
+  const current = Number(rawCurrent);
   const max = Number(rawMax);
-  if (!Number.isFinite(max) || max <= 0) return null;
+  if (!Number.isFinite(current) || !Number.isFinite(max) || max <= 0) return null;
+
+  const stat = readMemoryStat();
+  const reclaimable = stat
+    ? (stat.inactive_file || 0) + (stat.slab_reclaimable || 0)
+    : 0;
+  // Never let a bad reading make the working set look larger than the total.
+  const workingSet = Math.max(0, Math.min(current, current - reclaimable));
 
   return {
     usedMb: Math.round(current / 1048576),
     limitMb: Math.round(max / 1048576),
     usedPercent: Number(((100 * current) / max).toFixed(1)),
+    // What the kernel cannot reclaim without killing a process. This is the
+    // number that predicts an OOM kill, and the one shedding responds to.
+    workingSetMb: Math.round(workingSet / 1048576),
+    workingSetPercent: Number(((100 * workingSet) / max).toFixed(1)),
+    reclaimableMb: Math.round(reclaimable / 1048576),
   };
 }
 
@@ -185,7 +221,7 @@ function getStats(extra = {}) {
 // The store consults this to shed memory before the kernel does it for us.
 function memoryPressure() {
   const container = containerMemory();
-  return container ? container.usedPercent / 100 : null;
+  return container ? container.workingSetPercent / 100 : null;
 }
 
 function startSampling(intervalMs = 500) {
