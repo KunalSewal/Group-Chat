@@ -112,6 +112,9 @@ session is what has to go.
 
 ## Tuning without redeploying
 
+- The backend runs as `node` directly rather than through `npm start`: npm is
+  itself a Node process and stays resident for the life of the run, holding
+  around 51MB of a 512MB budget to do nothing but wait.
 - `MONGO_CACHE_GB` (default 0.25) — WiredTiger sizes its cache from the *host's*
   memory unless told otherwise, and the host has 128GB while the container is
   allowed 512MB. Leaving this unset is what killed mongod and the backend

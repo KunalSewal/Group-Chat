@@ -51,4 +51,16 @@ for _ in $(seq 1 60); do
 done
 
 cd "$SERVER_DIR"
-exec npm start
+
+# node directly, not through npm.
+#
+# npm is itself a Node process: "npm start" forks a shell, which forks node,
+# and then npm sits there for the life of the run holding around 51MB with the
+# shell holding another 2. On a container allowed 512MB that is a tenth of the
+# budget spent on a process whose only remaining job is to wait — and it is
+# charged against the same limit that decides which process the kernel kills.
+#
+# The flags match what package.json does, so running it by hand still behaves
+# the same way.
+export NODE_ENV="${NODE_ENV:-production}"
+exec node --env-file-if-exists=.env server.js
