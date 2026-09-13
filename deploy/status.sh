@@ -23,9 +23,11 @@ fi
 [ -r /sys/fs/cgroup/cpu.max ] && echo "cpu.max: $(cat /sys/fs/cgroup/cpu.max)"
 
 echo
-echo "=== processes ==="
-ps -o pid,rss,etime,cmd -C mongod 2>/dev/null | sed 's/^/  /' || true
-ps -o pid,rss,etime,cmd -C node 2>/dev/null | sed 's/^/  /' || true
+echo "=== processes (largest first) ==="
+# Everything resident, not a fixed list of names: on the balancer there is no
+# node and no mongod, and a status screen that showed nothing there was worse
+# than useless — it looked like the machine was empty.
+ps -eo pid,rss,etime,cmd --sort=-rss 2>/dev/null | head -8 | sed 's/^/  /' || true
 
 echo
 echo "=== health ==="

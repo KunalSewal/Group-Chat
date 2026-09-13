@@ -42,7 +42,10 @@ type Backend struct {
 
 	// Updated by the balancer itself, on every request, so selection reacts
 	// immediately rather than waiting for the next stats poll.
-	InFlight   atomic.Int64
+	InFlight atomic.Int64
+	// Upgraded connections, counted apart from queued work: they are held open
+	// by a reader, not by the backend being busy.
+	Tunnels    atomic.Int64
 	ewmaMicros atomic.Int64
 	Requests   atomic.Uint64
 	Failures   atomic.Uint64
@@ -53,9 +56,9 @@ type Backend struct {
 
 	// Reported by the backend and refreshed by the stats poller. CPU is held
 	// as hundredths of a percent so it can live in an atomic integer.
-	cpuCentis  atomic.Int64
+	cpuCentis   atomic.Int64
 	backendEwma atomic.Int64
-	StoredMsgs atomic.Int64
+	StoredMsgs  atomic.Int64
 
 	proxy *httputil.ReverseProxy
 }
@@ -235,6 +238,26 @@ func applyMemoryLimit() {
 	debug.SetMemoryLimit(soft)
 	log.Printf("memory limit: cgroup %dMB, GC soft limit set to %dMB",
 		limit/(1<<20), soft/(1<<20))
+}
+
+// A request that asks to be upgraded — a WebSocket, which this application
+// uses for the live chat — is tunnelled rather than served: the proxy holds it
+// open until one side goes away. That is not the backend being busy, so it
+// must not count towards the load the balancer is trying to even out.
+func isUpgrade(r *http.Request) bool {
+	if r.Header.Get("Upgrade") == "" {
+		return false
+	}
+	// Connection is a comma-separated token list, so a substring match would
+	// also hit values that merely contain the word.
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (lb *LoadBalancer) totalInFlight() int64 {
@@ -560,14 +583,36 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lb.metrics.Retries.Add(1)
 		}
 
-		backend.InFlight.Add(1)
 		backend.Requests.Add(1)
 		attemptStart := time.Now()
-
 		rec = &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		backend.proxy.ServeHTTP(rec, r)
 
-		backend.InFlight.Add(-1)
+		// The in-flight count drives the routing decision, so it has to come
+		// back down on every path out of ServeHTTP — including a panic, which
+		// net/http recovers at the connection level, well above this loop. It
+		// did not, and the counters on a balancer that had been up through a
+		// week of backends being OOM-killed had leaked into the thousands.
+		// Each leaked request adds its full weight to the score against a
+		// threshold of 4, so the balancer was choosing between three numbers
+		// that no longer described anything, which is worse than round-robin:
+		// it looks like it is measuring.
+		//
+		// A tunnelled connection is deliberately not counted. It is open for
+		// as long as the person has the chat window open, which is not
+		// queued work, and counting it would bias every routing decision for
+		// the life of the socket.
+		tunnelled := isUpgrade(r)
+		func() {
+			if !tunnelled {
+				backend.InFlight.Add(1)
+				defer backend.InFlight.Add(-1)
+			} else {
+				backend.Tunnels.Add(1)
+				defer backend.Tunnels.Add(-1)
+			}
+			backend.proxy.ServeHTTP(rec, r)
+		}()
+
 		backend.observe(time.Since(attemptStart))
 
 		if !rec.failed {
@@ -601,6 +646,7 @@ func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 		URL        string  `json:"url"`
 		Alive      bool    `json:"alive"`
 		InFlight   int64   `json:"in_flight"`
+		Tunnels    int64   `json:"tunnels"`
 		Score      float64 `json:"score"`
 		LatencyMs  float64 `json:"latency_ms"`
 		CPUPercent float64 `json:"cpu_percent"`
@@ -621,6 +667,7 @@ func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 			URL:        b.URL.String(),
 			Alive:      b.Alive.Load(),
 			InFlight:   b.InFlight.Load(),
+			Tunnels:    b.Tunnels.Load(),
 			Score:      math.Round(lb.score(b)*100) / 100,
 			LatencyMs:  math.Round(b.LatencyMs()*100) / 100,
 			CPUPercent: b.CPUPercent(),
