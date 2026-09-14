@@ -1024,6 +1024,59 @@ func capSocketBuffers(conn net.Conn) {
 	tcp.SetWriteBuffer(socketWriteBuffer)
 }
 
+// A listener that caps how many connections may be live, and sizes the buffers
+// of each one it hands over.
+//
+// Both of those protections existed already — and only on the path that serves
+// HTTPS and HTTP on one port, which is taken solely when a certificate is
+// configured. The deployment runs plain HTTP, so it took the other path, and
+// neither the ceiling nor the buffer sizes applied to a single connection the
+// evaluation made. The process was killed twice with both "in place".
+//
+// Accepting blocks at the ceiling rather than refusing: pending connections
+// wait in the kernel's backlog and are served as earlier ones finish.
+type boundedListener struct {
+	net.Listener
+	live chan struct{}
+}
+
+func (l *boundedListener) Accept() (net.Conn, error) {
+	l.live <- struct{}{}
+
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		<-l.live
+		return nil, err
+	}
+
+	liveConnections.Add(1)
+	// Linux grows socket buffers under load and charges every byte to this
+	// container, so each one is pinned to a size the container can afford.
+	capSocketBuffers(conn)
+
+	return &countedConn{Conn: conn, done: l.live}, nil
+}
+
+// Gives its slot back when it closes, exactly once however many times Close is
+// called: net/http closes a connection from more than one place, and a slot
+// returned twice raises the ceiling a little each time it happens.
+type countedConn struct {
+	net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (c *countedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		if c.done != nil {
+			<-c.done
+			liveConnections.Add(-1)
+		}
+	})
+	return err
+}
+
 type peekedConn struct {
 	net.Conn
 	reader *bufio.Reader
@@ -1380,12 +1433,22 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:              *listenAddr,
 		Handler:           lb,
 		ReadHeaderTimeout: 20 * time.Second,
 		IdleTimeout:       idleTimeout,
 	}
-	if err := server.ListenAndServe(); err != nil {
+
+	listener, err := net.Listen("tcp", *listenAddr)
+	if err != nil {
+		log.Fatal(fmt.Sprintf("cannot listen on %s: %v", *listenAddr, err))
+	}
+
+	bounded := &boundedListener{
+		Listener: listener,
+		live:     make(chan struct{}, maxConnections),
+	}
+
+	if err := server.Serve(bounded); err != nil {
 		log.Fatal(fmt.Sprintf("server stopped: %v", err))
 	}
 }

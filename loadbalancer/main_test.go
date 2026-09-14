@@ -261,3 +261,77 @@ func TestConnectionCeilingServesEveryoneEventually(t *testing.T) {
 		t.Fatalf("a client was refused rather than queued: %v", err)
 	}
 }
+
+// The same guarantee, on the listener the deployment actually uses. The
+// previous test covered the multiplexed path, which is only taken when a
+// certificate is configured — and the protections it exercised were therefore
+// absent from every run that mattered.
+func TestBoundedListenerQueuesRatherThanRefusing(t *testing.T) {
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A process-wide counter, and other tests in this package leave connections
+	// of their own open, so what must return to where it started is the delta.
+	baseline := liveConnections.Load()
+
+	const ceiling = 4
+	bounded := &boundedListener{Listener: raw, live: make(chan struct{}, ceiling)}
+	defer bounded.Close()
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	go server.Serve(bounded)
+	defer server.Close()
+
+	addr := raw.Addr().String()
+	const clients = 40
+
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout:   10 * time.Second,
+				Transport: &http.Transport{DisableKeepAlives: true},
+			}
+			resp, err := client.Get("http://" + addr + "/")
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("clients stalled at the ceiling: a slot was not given back on close")
+	}
+
+	close(errs)
+	for err := range errs {
+		t.Fatalf("a client was refused rather than queued: %v", err)
+	}
+
+	// Every slot must be free again, or the ceiling ratchets down over a run
+	// until nothing can be accepted at all.
+	deadline := time.Now().Add(5 * time.Second)
+	for liveConnections.Load() != baseline && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := liveConnections.Load(); got != baseline {
+		t.Fatalf("%d connection slots were never returned", got-baseline)
+	}
+}
