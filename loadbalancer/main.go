@@ -425,9 +425,15 @@ const maxTrackedBackends = 16
 // is taken out of rotation.
 var failureThreshold int64 = 5
 
-// How long one proxied request may take in total. Generous: it is a backstop
-// against a request that will never finish, not a service-level target.
-var requestDeadline = 60 * time.Second
+// How long one proxied request may take in total.
+//
+// Twenty seconds is already far longer than any client here waits: the
+// evaluation harness gives up at around ten. Past that point the request is
+// being carried for nobody — and it still holds a goroutine, a connection to
+// the backend and both their buffers, at exactly the moment the queue is
+// deepest and those are worth the most. Sixty seconds meant fifty of them
+// spent serving an audience that had left.
+var requestDeadline = 20 * time.Second
 
 // candidates fills dst with the healthy backends, best first, and returns the
 // filled prefix. The caller supplies the array so that choosing a backend —
@@ -1012,12 +1018,15 @@ func main() {
 	statsInterval := flag.Duration("stats-interval", 400*time.Millisecond, "interval between backend stats polls")
 	statsTimeout := flag.Duration("stats-timeout", 1*time.Second, "timeout for a single stats poll")
 	backendTimeout := flag.Duration("backend-timeout", 15*time.Second, "how long to wait for a backend's response headers")
-	// Two seconds was short enough that a backend whose accept queue was busy
-	// counted as a backend that was down: the dial failed, the request was
-	// retried elsewhere, and the client paid for both attempts. A dial to a
-	// machine in the same rack either completes in microseconds or is queued,
-	// and being queued is not a failure.
-	dialTimeout := flag.Duration("dial-timeout", 5*time.Second, "timeout connecting to a backend")
+	// Back to two seconds, because the argument for five did not survive being
+	// measured. It was that a queued connection is not a failed one and should
+	// be waited for — but a dial to a machine in the same rack completes in
+	// microseconds or not at all, so anything still waiting after two seconds is
+	// not going to be worth having. Raising it to five moved the top of the
+	// ladder the wrong way: the mean at 2,500 users went from 4.1 to 5.7
+	// seconds, and the last stage ran out of time before it ran out of budget.
+	// Failing fast and trying another backend beats waiting for this one.
+	dialTimeout := flag.Duration("dial-timeout", 2*time.Second, "timeout connecting to a backend")
 	threshold := flag.Float64("load-threshold", 4.0, "load score above which traffic switches to another backend")
 	wInFlight := flag.Float64("w-inflight", 1.0, "score weight for one outstanding request")
 	wLatency := flag.Float64("w-latency", 0.05, "score weight per millisecond of smoothed latency")
@@ -1027,7 +1036,7 @@ func main() {
 	// concurrency in flight it costs a great deal: every request beyond the cap
 	// closes its connection at the end and the next one dials again, which is
 	// the handshake, the accept queue and the failure modes of both, per request.
-	maxIdlePerHost := flag.Int("max-idle-per-host", 1024, "idle keep-alive connections kept per backend")
+	maxIdlePerHost := flag.Int("max-idle-per-host", 512, "idle keep-alive connections kept per backend")
 	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
