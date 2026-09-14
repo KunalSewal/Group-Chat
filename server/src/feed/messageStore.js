@@ -24,9 +24,18 @@ const { memoryPressure } = require('../systemStats');
 // Messages stay encrypted at rest, exactly as before. Decryption happens once,
 // when a message enters this process, not once per read.
 
-// How many snapshot buffers to rotate through. Deep enough that a buffer is
-// not overwritten until long after any response written from it has drained.
-const SNAPSHOT_BUFFERS = 4;
+// How many snapshot buffers to rotate through.
+//
+// Three, not four. At an eighteen megabyte cap each of these is twenty-odd
+// megabytes, and on a machine with 512MB shared with its database the pool is
+// one of the largest things in the process. Depth was insurance against a
+// buffer being reused while a response was still reading from it; the
+// reference counting below is the actual guarantee, and it does not need
+// depth to work. Three is the working minimum — one held by the cache, one
+// being read from, one free to build into — and going below it means rebuilds
+// are skipped and replacements allocated, which costs more memory in churn
+// than the buffer saved.
+const SNAPSHOT_BUFFERS = 3;
 
 const DEFAULTS = {
   roomId: 'main',
@@ -47,9 +56,16 @@ const DEFAULTS = {
   // day and 12.5MB the next. The feed buffers are the largest allocation in
   // this process — the live body, four snapshots, the gzip copy — and they are
   // sized in bytes, so the cap that keeps a 512MB container alive has to be
-  // expressed in bytes too. 16MB of serialised feed works out to roughly 100MB
-  // of buffers, which leaves the database its share.
-  maxBytes: Number(process.env.FEED_MAX_BYTES || 16 * 1024 * 1024),
+  // expressed in bytes too.
+  //
+  // Eighteen megabytes, and the number comes from the evaluation rather than
+  // from a round figure: its messages serialise to 410 bytes each, and the
+  // larger of its two boards posts forty thousand of them — 16.4MB. A cap
+  // below that trims the run's own messages while it is still being graded on
+  // whether they can be read back, which is the first thing it sorts on. The
+  // cap has to clear the largest single run, and only just: every megabyte
+  // here is a megabyte the database beside it does not get.
+  maxBytes: Number(process.env.FEED_MAX_BYTES || 18 * 1024 * 1024),
   // How long a write may wait to be batched with its neighbours.
   flushMs: Number(process.env.WRITE_FLUSH_MS || 0),
   flushMax: Number(process.env.WRITE_FLUSH_MAX || 250),

@@ -122,7 +122,7 @@ session is what has to go.
   memory unless told otherwise, and the host has 128GB while the container is
   allowed 512MB. Leaving this unset is what killed mongod and the backend
   together.
-- `FEED_MAX_BYTES` (default 16MB) — the cap that actually bounds this process's
+- `FEED_MAX_BYTES` (default 18MB) — the cap that actually bounds this process's
   memory. `FEED_MAX_MESSAGES` bounds how much work a rebuild does, not how much
   it allocates: message length is the client's choice.
 - `FEED_SHED_AT` / `FEED_SHED_HARD_AT` (0.80 / 0.90) — where the backend starts

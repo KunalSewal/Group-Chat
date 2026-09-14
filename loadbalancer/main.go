@@ -1100,6 +1100,7 @@ func main() {
 	// closes its connection at the end and the next one dials again, which is
 	// the handshake, the accept queue and the failure modes of both, per request.
 	maxIdlePerHost := flag.Int("max-idle-per-host", 1024, "idle keep-alive connections kept per backend")
+	maxConnsPerHost := flag.Int("max-conns-per-host", 256, "most requests a single backend may be working on at once; 0 is unlimited")
 	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
@@ -1138,8 +1139,23 @@ func main() {
 		// under load pays for a fresh TCP handshake. At a thousand concurrent
 		// clients that cost dominates everything the backend actually does.
 		MaxIdleConnsPerHost: *maxIdlePerHost,
-		MaxIdleConns:        *maxIdlePerHost * 4,
-		IdleConnTimeout:     90 * time.Second,
+		// A ceiling on how many requests a backend may be working on at once.
+		//
+		// Each connection a backend accepts costs it memory, and these backends
+		// have 512MB to share with their database. Under the evaluation's top
+		// stages they reached 250-280MB of resident memory with 39MB of heap,
+		// the container hit its limit 313,774 times, a single database write
+		// took 68 seconds while every request batched into it waited, and one
+		// machine was killed outright.
+		//
+		// Requests past the ceiling wait here instead, on the machine that has
+		// no database beside it and memory to spare. Nothing is refused and
+		// nothing is lost — they queue one hop earlier, where queueing is cheap.
+		// A backend entitled to a single core is saturated long before 256
+		// concurrent requests, so this costs no throughput it could have used.
+		MaxConnsPerHost: *maxConnsPerHost,
+		MaxIdleConns:    *maxIdlePerHost * 4,
+		IdleConnTimeout: 90 * time.Second,
 		// Let the client's own Accept-Encoding reach the backend and its
 		// compressed response come back untouched. Without this, Go would
 		// transparently decompress every /feed response here and the client
