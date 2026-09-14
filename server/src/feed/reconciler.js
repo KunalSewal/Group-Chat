@@ -35,7 +35,7 @@ const DEFAULTS = {
   // forever — tens of thousands of ids on the one core that is also serving
   // the requests. So a round that finds a difference it cannot repair backs
   // off, and any round that actually repairs something resets it.
-  maxIntervalMs: Number(process.env.RECONCILE_MAX_INTERVAL_MS || 300000),
+  maxIntervalMs: Number(process.env.RECONCILE_MAX_INTERVAL_MS || 60000),
 };
 
 class Reconciler {

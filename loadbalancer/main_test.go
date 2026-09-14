@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 )
@@ -176,5 +179,85 @@ func TestAStalledResponseDoesNotHoldTheRequestForever(t *testing.T) {
 
 	if got := backend.InFlight.Load(); got != 0 {
 		t.Fatalf("in-flight stuck at %d after the deadline expired", got)
+	}
+}
+
+// The connection ceiling must bound how many are live without ever losing a
+// client. Pending connections wait in the kernel backlog and are served as
+// earlier ones finish; a slot that is not given back on close would stall the
+// balancer permanently, which is a far worse failure than the one the ceiling
+// exists to prevent.
+func TestConnectionCeilingServesEveryoneEventually(t *testing.T) {
+	previous := maxConnections
+	maxConnections = 4
+	defer func() { maxConnections = previous }()
+
+	served := make(chan struct{}, 256)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		served <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	go func() {
+		if err := serveMultiplexed(addr, handler, "", ""); err != nil && !errors.Is(err, net.ErrClosed) {
+			return
+		}
+	}()
+
+	// Give the listener a moment to come up.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("balancer never started listening")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Many more clients than the ceiling, each on its own connection.
+	const clients = 40
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout:   10 * time.Second,
+				Transport: &http.Transport{DisableKeepAlives: true},
+			}
+			resp, err := client.Get("http://" + addr + "/lb/health")
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("clients stalled at the ceiling; %d of %d were served", len(served), clients)
+	}
+
+	close(errs)
+	for err := range errs {
+		t.Fatalf("a client was refused rather than queued: %v", err)
 	}
 }

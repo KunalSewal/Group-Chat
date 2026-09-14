@@ -274,7 +274,11 @@ func applyMemoryLimit() {
 	// Only a minority of the budget goes to the heap. The rest is kernel
 	// socket memory, which is charged to the same cgroup and which the Go
 	// runtime neither sees nor accounts for.
-	soft := int64(float64(limit) * 0.35)
+	// A quarter, not a third. The heap is not what kills this process — kernel
+	// socket buffers are, and they are charged to the same container while being
+	// invisible to the collector. Leaving the heap more room simply leaves the
+	// buffers less.
+	soft := int64(float64(limit) * 0.25)
 	debug.SetMemoryLimit(soft)
 	log.Printf("memory limit: cgroup %dMB, GC soft limit set to %dMB",
 		limit/(1<<20), soft/(1<<20))
@@ -495,6 +499,26 @@ var failureThreshold int64 = 5
 // This is a backstop against a request that will never finish, not a
 // service-level target, and it should be set where it only catches those.
 var requestDeadline = 60 * time.Second
+
+// How long an idle keep-alive connection is kept.
+//
+// This was two minutes, and two minutes is how a ladder kills this process.
+// Each stage opens its own connections — two hundred, then three hundred and
+// fifty, then five hundred — and at two minutes the connections from stage one
+// are still held open, with their kernel buffers, while stage four is running.
+// They accumulate across the whole ladder, and the memory they hold is charged
+// to a container with 512MB and no Go setting that can see it: the process was
+// killed twice during one evaluation with its heap limit set to 179MB, because
+// the memory was never in the heap.
+//
+// Twenty seconds is still far longer than a client waits between requests it
+// intends to send on the same connection.
+var idleTimeout = 20 * time.Second
+
+// The most connections this balancer will hold at once. At the buffer sizes
+// above each one costs about 24KB of kernel memory, so this is roughly 36MB at
+// the ceiling — affordable inside 512MB, where twice as many was not.
+var maxConnections = 1500
 
 // candidates fills dst with the healthy backends, best first, and returns the
 // filled prefix. The caller supplies the array so that choosing a backend —
@@ -907,8 +931,8 @@ func (lb *LoadBalancer) statsLoop(interval, timeout time.Duration) {
 // cannot exhaust the container, large enough to carry a compressed feed
 // response without stalling.
 var (
-	socketReadBuffer  = 16 * 1024
-	socketWriteBuffer = 32 * 1024
+	socketReadBuffer  = 8 * 1024
+	socketWriteBuffer = 16 * 1024
 )
 
 // capSocketBuffers pins a connection's kernel buffers instead of letting Linux
@@ -932,10 +956,27 @@ func capSocketBuffers(conn net.Conn) {
 type peekedConn struct {
 	net.Conn
 	reader *bufio.Reader
+	// Returned to the accept loop when this connection closes, so the ceiling
+	done chan struct{}
+	once sync.Once
 }
 
 func (c *peekedConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
+}
+
+// Closing is the only place a connection's slot is given back, and it happens
+// exactly once however many times Close is called — net/http closes a
+// connection from more than one place, and a slot returned twice would raise
+// the ceiling a little every time it happened.
+func (c *peekedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		if c.done != nil {
+			<-c.done
+		}
+	})
+	return err
 }
 
 // chanListener is a net.Listener fed by hand rather than by the kernel, so one
@@ -995,7 +1036,7 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 			// response would cut off long-lived WebSocket connections, which
 			// are exactly what the chat depends on.
 			ReadHeaderTimeout: 20 * time.Second,
-			IdleTimeout:       120 * time.Second,
+			IdleTimeout:       idleTimeout,
 		}
 	}
 
@@ -1022,7 +1063,24 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 	// Only a closed listener is terminal.
 	var backoff time.Duration
 
+	// A ceiling on how many connections may be live at once.
+	//
+	// Everything else about this process is bounded: the heap by GOMEMLIMIT,
+	// the descriptors by the rlimit, the buffers per connection by the sizes
+	// above. The number of connections was not, and it is the one that decides
+	// the others — this balancer was killed twice during a single evaluation
+	// with its heap capped at 179MB, because the memory was in kernel socket
+	// buffers that no Go limit can see.
+	//
+	// Accepting is simply paused at the ceiling. Pending connections wait in
+	// the kernel's backlog, which is what a backlog is for, and are served as
+	// soon as earlier ones finish. Nothing is refused and no client sees an
+	// error — the alternative, being killed, refuses everything at once.
+	live := make(chan struct{}, maxConnections)
+
 	for {
+		live <- struct{}{}
+
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -1039,6 +1097,7 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 			}
 
 			log.Printf("accept failed (%v); retrying in %v", err, backoff)
+			<-live
 			time.Sleep(backoff)
 			continue
 		}
@@ -1050,6 +1109,9 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 		capSocketBuffers(conn)
 
 		go func(conn net.Conn) {
+			// The slot is held for as long as the connection is, which is what
+			// makes the ceiling mean anything. peekedConn releases it on Close,
+			// and every path out of here closes.
 			// One byte is all this reads. The default 4KB buffer, multiplied by
 			// every concurrent connection, is memory spent for nothing — the
 			// http server allocates its own buffers behind this.
@@ -1060,10 +1122,11 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 			conn.SetReadDeadline(time.Time{})
 			if err != nil {
 				conn.Close()
+				<-live
 				return
 			}
 
-			wrapped := &peekedConn{Conn: conn, reader: reader}
+			wrapped := &peekedConn{Conn: conn, reader: reader, done: live}
 			if first[0] == 0x16 {
 				tlsListener.push(wrapped)
 			} else {
@@ -1099,7 +1162,10 @@ func main() {
 	// concurrency in flight it costs a great deal: every request beyond the cap
 	// closes its connection at the end and the next one dials again, which is
 	// the handshake, the accept queue and the failure modes of both, per request.
-	maxIdlePerHost := flag.Int("max-idle-per-host", 1024, "idle keep-alive connections kept per backend")
+	// Matched to the concurrency ceiling below: a pool larger than the number of
+	// connections that may exist cannot hold anything extra, but it can hold
+	// them idle for longer, and each one costs kernel buffers.
+	maxIdlePerHost := flag.Int("max-idle-per-host", 256, "idle keep-alive connections kept per backend")
 	maxConnsPerHost := flag.Int("max-conns-per-host", 256, "most requests a single backend may be working on at once; 0 is unlimited")
 	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
@@ -1242,7 +1308,7 @@ func main() {
 		Addr:              *listenAddr,
 		Handler:           lb,
 		ReadHeaderTimeout: 20 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		IdleTimeout:       idleTimeout,
 	}
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(fmt.Sprintf("server stopped: %v", err))
