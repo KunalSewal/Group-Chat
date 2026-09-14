@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"testing"
+	"time"
 )
 
 // A ResponseWriter that gives up the way the real one does when the client has
@@ -119,5 +120,61 @@ func TestUpgradeDetection(t *testing.T) {
 				t.Fatalf("isUpgrade = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// A backend that accepts the request, sends headers, and then simply stops is
+// the case -backend-timeout does not cover: the headers arrived, so nothing is
+// waiting on them any more, and the body never comes. Without an overall
+// deadline the goroutine and its connection are held for the life of the
+// process, and the in-flight count the routing decision uses never comes back
+// down.
+func TestAStalledResponseDoesNotHoldTheRequestForever(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000000")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer origin.Close()
+
+	target, _ := url.Parse(origin.URL)
+	backend := &Backend{URL: target, proxy: httputil.NewSingleHostReverseProxy(target)}
+	backend.Alive.Store(true)
+
+	lb := &LoadBalancer{
+		metrics:  newMetrics(256),
+		weights:  Weights{InFlight: 1, Latency: 0.05, CPU: 0.10},
+		backends: []*Backend{backend},
+	}
+	lb.SetThreshold(4)
+
+	previous := requestDeadline
+	requestDeadline = 300 * time.Millisecond
+	defer func() { requestDeadline = previous }()
+
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			recover() // an aborted copy surfaces as ErrAbortHandler
+			close(done)
+		}()
+		lb.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/feed", nil))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled response held the request past its deadline")
+	}
+
+	if got := backend.InFlight.Load(); got != 0 {
+		t.Fatalf("in-flight stuck at %d after the deadline expired", got)
 	}
 }

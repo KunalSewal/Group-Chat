@@ -425,6 +425,10 @@ const maxTrackedBackends = 16
 // is taken out of rotation.
 var failureThreshold int64 = 5
 
+// How long one proxied request may take in total. Generous: it is a backstop
+// against a request that will never finish, not a service-level target.
+var requestDeadline = 60 * time.Second
+
 // candidates fills dst with the healthy backends, best first, and returns the
 // filled prefix. The caller supplies the array so that choosing a backend —
 // which happens on every single request — allocates nothing.
@@ -565,6 +569,25 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Buffer the body once so a retry against a different backend can replay
 	// it; a request body is a stream and can only be read a single time.
+	// Every proxied request gets a deadline.
+	//
+	// -backend-timeout bounds only the wait for response headers. Once those
+	// arrive nothing bounds the rest, so a response whose body stops arriving
+	// leaves a goroutine, a backend connection and its buffers held for as long
+	// as the process lives. Measured after one ladder to 2,500 users: 197
+	// requests still in flight and 521 goroutines with the cluster completely
+	// idle, minutes after the client that asked for them had given up. They
+	// never come back on their own, they are charged against the in-flight
+	// count the routing decision is made from, and they accumulate run over
+	// run on the machine that has been OOM-killed more than any other.
+	//
+	// An upgraded connection is exempt: it is meant to stay open.
+	if requestDeadline > 0 && !isUpgrade(r) {
+		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
+
 	var bodyBytes []byte
 	if r.Body != nil && r.Body != http.NoBody {
 		bodyBytes, _ = io.ReadAll(r.Body)
@@ -976,6 +999,7 @@ func main() {
 	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
+	flag.DurationVar(&requestDeadline, "request-timeout", requestDeadline, "overall deadline for one proxied request; 0 disables")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate; with -tls-key, the same port also serves HTTPS")
 	tlsKey := flag.String("tls-key", "", "TLS certificate private key")
 	flag.Parse()
