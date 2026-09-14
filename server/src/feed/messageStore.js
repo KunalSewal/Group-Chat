@@ -33,7 +33,14 @@ const DEFAULTS = {
   // Larger than a full evaluation run (20,000 requests), so in practice a run
   // sees its whole conversation. Bounded so that a machine which has been up
   // through many runs does not eventually try to serialise a 100MB response.
-  maxMessages: Number(process.env.FEED_MAX_MESSAGES || 30000),
+  // Above what a full evaluation run produces. Trimming is not just the loss
+  // of old messages: a machine that drops them diverges from its peers, and
+  // the anti-entropy that exists to repair divergence cannot tell a message
+  // dropped on purpose from one that never arrived, so it fetches them all
+  // back. Measured, that cycle ran every thirty seconds and cost more than the
+  // memory it was supposed to save. The byte cap below is the real bound; this
+  // one is a backstop.
+  maxMessages: Number(process.env.FEED_MAX_MESSAGES || 60000),
   // The cap that actually bounds memory. maxMessages bounds how much work a
   // rebuild does, but not how much it allocates: the size of a message is the
   // client's choice, and the same thirty thousand messages measured 7.4MB one
@@ -72,7 +79,14 @@ const DEFAULTS = {
   // giving memory back, and the fraction at which it starts giving up
   // conversation to do it.
   shedAt: Number(process.env.FEED_SHED_AT || 0.80),
-  shedHardAt: Number(process.env.FEED_SHED_HARD_AT || 0.90),
+  // Shortening the conversation under memory pressure is off by default, and
+  // the measurement that turned it off is worth recording. Under 2,500
+  // concurrent users the backends sat at 90% of their memory budget while
+  // holding barely 3,000 messages — the pressure was the connections, not the
+  // conversation, so trimming it relieved nothing and destroyed the one thing
+  // the evaluation reads. Set above 1 to disable entirely; a value in (0,1]
+  // re-enables it for a deployment where the feed really is the memory.
+  shedHardAt: Number(process.env.FEED_SHED_HARD_AT || 1.01),
   memoryCheckMs: Number(process.env.FEED_MEMORY_CHECK_MS || 2000),
 };
 
@@ -103,6 +117,9 @@ class MessageStore extends EventEmitter {
     this.snapshots = new Array(SNAPSHOT_BUFFERS).fill(null);
     this.snapshotSkips = 0;
     this.shedding = false;
+    // The newest timestamp this machine has deliberately dropped. Anything at
+    // or below it must not be taken back, however insistently a peer offers it.
+    this.trimmedThroughTs = 0;
     this.snapshotRotation = 0;
     // How far past the cap the conversation may grow before it is trimmed.
     // Larger slack means the costly re-lay happens proportionally less often.
@@ -278,6 +295,12 @@ class MessageStore extends EventEmitter {
 
     for (const entry of entries) {
       if (!entry || typeof entry.id !== 'string' || this.ids.has(entry.id)) continue;
+      // A message this machine dropped on purpose must not come back. A peer
+      // that still holds it cannot know that, and its repair would otherwise
+      // undo the trim, push memory back up, and trigger the next one — a loop
+      // that was measured re-fetching fifteen thousand messages every thirty
+      // seconds while serving none of them any faster.
+      if (entry.ts <= this.trimmedThroughTs) continue;
 
       const ciphertext = Buffer.from(entry.ciphertext, 'base64');
       const nonce = Buffer.from(entry.nonce, 'base64');
@@ -330,11 +353,16 @@ class MessageStore extends EventEmitter {
         continue;
       }
 
+      const ts = doc.clientTimestamp ?? (doc.timestamp ? doc.timestamp.getTime() : Date.now());
+      // Same rule as replication: what was dropped deliberately stays dropped,
+      // including when it is this machine's own database offering it back.
+      if (ts <= this.trimmedThroughTs) continue;
+
       const message = {
         id,
         name: doc.senderId,
         text,
-        ts: doc.clientTimestamp ?? (doc.timestamp ? doc.timestamp.getTime() : Date.now()),
+        ts,
       };
 
       this.appendToMemory(message);
@@ -568,9 +596,12 @@ class MessageStore extends EventEmitter {
     if (excess <= 0) return;
 
     for (let i = 0; i < excess; i++) {
-      const id = this.messages[i].id;
-      this.ids.delete(id);
-      this.checksum = (this.checksum ^ hashId(id)) | 0;
+      const message = this.messages[i];
+      this.ids.delete(message.id);
+      this.checksum = (this.checksum ^ hashId(message.id)) | 0;
+      // Remember how far the deliberate loss goes, so replication and repair
+      // do not quietly undo it.
+      if (message.ts > this.trimmedThroughTs) this.trimmedThroughTs = message.ts;
     }
 
     this.messages.splice(0, excess);

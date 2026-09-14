@@ -22,6 +22,13 @@ const DEFAULTS = {
   // missed a lot never turns into one enormous request.
   batchSize: Number(process.env.RECONCILE_BATCH || 2000),
   timeoutMs: Number(process.env.RECONCILE_TIMEOUT_MS || 5000),
+  // Two machines can disagree permanently and correctly: one of them trimmed
+  // its conversation and will not take the difference back. Comparing them
+  // then means fetching a list of every id the peer holds, every round,
+  // forever — tens of thousands of ids on the one core that is also serving
+  // the requests. So a round that finds a difference it cannot repair backs
+  // off, and any round that actually repairs something resets it.
+  maxIntervalMs: Number(process.env.RECONCILE_MAX_INTERVAL_MS || 300000),
 };
 
 class Reconciler {
@@ -31,7 +38,8 @@ class Reconciler {
     this.peers = peerUrls.map((raw) => String(raw).trim().replace(/\/$/, '')).filter(Boolean);
     this.timer = null;
     this.running = false;
-    this.counters = { rounds: 0, repaired: 0, errors: 0 };
+    this.counters = { rounds: 0, repaired: 0, errors: 0, backoffMs: 0 };
+    this.currentIntervalMs = this.options.intervalMs;
   }
 
   get enabled() {
@@ -39,7 +47,7 @@ class Reconciler {
   }
 
   stats() {
-    return { ...this.counters };
+    return { ...this.counters, intervalMs: this.currentIntervalMs };
   }
 
   async request(url, init = {}) {
@@ -88,13 +96,14 @@ class Reconciler {
   }
 
   async runOnce() {
-    if (!this.enabled || this.running) return;
+    if (!this.enabled || this.running) return 0;
     this.running = true;
     this.counters.rounds += 1;
 
+    let repaired = 0;
     for (const peer of this.peers) {
       try {
-        this.counters.repaired += await this.reconcileWith(peer);
+        repaired += await this.reconcileWith(peer);
       } catch (err) {
         // A peer being unreachable is the case this exists for, not an error
         // worth making noise about; the next round tries again.
@@ -102,7 +111,19 @@ class Reconciler {
       }
     }
 
+    this.counters.repaired += repaired;
     this.running = false;
+
+    // Repairing something means the peers are converging and this is worth
+    // doing often. Repairing nothing, round after round, means either there is
+    // nothing wrong or there is something this cannot fix — and both are
+    // reasons to ask less frequently.
+    this.currentIntervalMs = repaired > 0
+      ? this.options.intervalMs
+      : Math.min(this.currentIntervalMs * 2, this.options.maxIntervalMs);
+    this.counters.backoffMs = this.currentIntervalMs;
+
+    return repaired;
   }
 
   start() {
@@ -112,12 +133,18 @@ class Reconciler {
     // after missing messages entirely.
     setTimeout(() => this.runOnce(), 1000).unref?.();
 
-    this.timer = setInterval(() => this.runOnce(), this.options.intervalMs);
-    this.timer.unref?.();
+    const schedule = () => {
+      this.timer = setTimeout(async () => {
+        await this.runOnce();
+        schedule();
+      }, this.currentIntervalMs);
+      this.timer.unref?.();
+    };
+    schedule();
   }
 
   stop() {
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
 }
