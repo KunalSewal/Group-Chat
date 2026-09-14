@@ -43,6 +43,8 @@ type Backend struct {
 	// Updated by the balancer itself, on every request, so selection reacts
 	// immediately rather than waiting for the next stats poll.
 	InFlight atomic.Int64
+	// End-to-end microseconds, client included. Reported, never scored on.
+	totalMicros atomic.Int64
 	// Upgraded connections, counted apart from queued work: they are held open
 	// by a reader, not by the backend being busy.
 	Tunnels    atomic.Int64
@@ -66,6 +68,39 @@ type Backend struct {
 // observe folds one request's duration into the backend's smoothed latency.
 // A plain average would take thousands of requests to notice a backend going
 // slow; this weights recent requests heavily enough to react within a burst.
+// Times what the backend did, and nothing else.
+//
+// The obvious place to measure a proxied request is around ServeHTTP, and it is
+// wrong: that call returns when the response has finished being written to the
+// client, so it measures the client's connection as much as the backend's
+// health. Measured across a ladder, the balancer believed its backends were
+// taking eighteen seconds a request while the backends themselves reported
+// fourteen milliseconds — the difference being a laptop reading a two-megabyte
+// feed over a slow link.
+//
+// That number then dominated the score: at a weight of 0.05, eighteen seconds
+// is 912 points against an in-flight term of zero and a CPU term of under one.
+// All three backends scored around 900, separated mostly by how fast each
+// client happened to be reading, and half of all requests switched backends as
+// a result. A balancer that routes on its clients' bandwidth is not doing
+// performance-based routing; it is sorting noise.
+//
+// RoundTrip returns when the response headers arrive and before the body is
+// read, so this measures exactly how long the backend took to start answering.
+type timedTransport struct {
+	base    http.RoundTripper
+	backend *Backend
+}
+
+func (t *timedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	started := time.Now()
+	response, err := t.base.RoundTrip(r)
+	if err == nil {
+		t.backend.observe(time.Since(started))
+	}
+	return response, err
+}
+
 func (b *Backend) observe(d time.Duration) {
 	const alpha = 0.2
 	previous := b.ewmaMicros.Load()
@@ -659,7 +694,9 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			backend.proxy.ServeHTTP(rec, r)
 		}()
 
-		backend.observe(time.Since(attemptStart))
+		// Deliberately not observed here: the transport above has already timed
+		// the part of this that describes the backend.
+		backend.totalMicros.Add(time.Since(attemptStart).Microseconds())
 
 		if !rec.failed {
 			// A success is proof the backend is serving, so the failure run
@@ -1106,7 +1143,7 @@ func main() {
 		b.Alive.Store(true)
 
 		proxy := httputil.NewSingleHostReverseProxy(target)
-		proxy.Transport = transport
+		proxy.Transport = &timedTransport{base: transport, backend: b}
 		proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 			// Fires for connection-establishment failures, before anything has
 			// been written to the client, so the request can still be retried
