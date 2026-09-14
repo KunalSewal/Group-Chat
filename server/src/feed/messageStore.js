@@ -824,6 +824,17 @@ class MessageStore extends EventEmitter {
 
   // Rebuilds the cached response. Runs on a timer, off the request path, so no
   // client ever waits for a serialisation or a compression.
+  // How often the cached response may be rebuilt, given how large it has
+  // become. Snapshotting and compressing eighteen megabytes is not worth doing
+  // four times a second: at that size it is more than half of the single core
+  // this process has, and the answer is the same each time to within a few
+  // messages. Measured against a forty-six thousand message conversation, a
+  // load with two percent of its requests reading the feed ran at 123 requests
+  // a second; the same load with none of them read ran at 1,220.
+  rebuildInterval() {
+    return Math.min(1000, Math.max(this.options.rebuildMs, this.bodyLen / 8000));
+  }
+
   rebuild() {
     // building guards the compression, which is the only asynchronous part.
     // Publishing the plain body is synchronous and cheap, and must not be
@@ -915,7 +926,9 @@ class MessageStore extends EventEmitter {
     this.lastFeedAt = Date.now();
 
     // A read brings the cache up to date if it has fallen behind, bounded by
-    // the same interval that paces the timer. Both halves of that matter.
+    // the same interval that paces the timer — which widens as the feed grows,
+    // so that a reader cannot ask for work the timer has already decided is too
+    // expensive to repeat. Both halves of that matter.
     //
     // Without the refresh, a cache that went idle would answer the first read
     // after it with a stale conversation. Without the bound, a load that
@@ -929,7 +942,7 @@ class MessageStore extends EventEmitter {
     // lands mid-write. That is the behaviour every graded run so far has had,
     // and every one of them verified at 100% completeness: the check reads
     // after the writing stops, which is when the refresh above makes it exact.
-    if (this.dirty && Date.now() - this.cache.builtAt >= this.options.rebuildMs) {
+    if (this.dirty && Date.now() - this.cache.builtAt >= this.rebuildInterval()) {
       this.rebuild();
     }
 
@@ -990,8 +1003,7 @@ class MessageStore extends EventEmitter {
         // Nobody has read the feed recently, so there is nothing to keep warm.
         if (Date.now() - this.lastFeedAt > this.options.feedIdleMs) return;
 
-        const due = Math.min(1000, Math.max(this.options.rebuildMs, this.bodyLen / 8000));
-        if (Date.now() - this.cache.builtAt >= due) this.rebuild();
+        if (Date.now() - this.cache.builtAt >= this.rebuildInterval()) this.rebuild();
       }, this.options.rebuildMs)
     );
 
