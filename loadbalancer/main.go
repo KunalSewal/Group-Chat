@@ -207,6 +207,61 @@ func (m *Metrics) snapshot() map[string]any {
 // with what the container is actually entitled to.
 //
 // runtime.NumCPU() reports the host's cores — 120 on the lab machine — but the
+// What this container is charged, and how much of it cannot be reclaimed
+// without killing something.
+//
+// This process has been killed by the kernel more often than anything else in
+// the deployment, and until now the only evidence was a counter in a file
+// nobody was reading. /lb/stats reports CPU and goroutines; it did not report
+// the one number that predicts the kill, so a run could be watched from
+// outside without the thing that ends it ever being visible.
+//
+// memory.current includes the page cache, which the kernel drops for free, so
+// the working set subtracts what is reclaimable — the same accounting the
+// backends use, which keeps the four machines comparable in the report.
+func containerMemory() (usedMB, limitMB, workingSetMB int64) {
+	readInt := func(path string) int64 {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return -1
+		}
+		value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			return -1
+		}
+		return value
+	}
+
+	current := readInt("/sys/fs/cgroup/memory.current")
+	limit := readInt("/sys/fs/cgroup/memory.max")
+	if current < 0 || limit <= 0 {
+		return -1, -1, -1
+	}
+
+	var reclaimable int64
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.stat"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				continue
+			}
+			if fields[0] == "inactive_file" || fields[0] == "slab_reclaimable" {
+				if value, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					reclaimable += value
+				}
+			}
+		}
+	}
+
+	working := current - reclaimable
+	if working < 0 {
+		working = current
+	}
+
+	const mb = 1024 * 1024
+	return current / mb, limit / mb, working / mb
+}
+
 // cgroup quota here grants the equivalent of one. Left alone, Go would run 120
 // schedulable threads against that single CPU's worth of time, and the kernel
 // would throttle the whole process once the quota ran out inside each period.
@@ -520,6 +575,10 @@ var idleTimeout = 20 * time.Second
 // the ceiling — affordable inside 512MB, where twice as many was not.
 var maxConnections = 1500
 
+// How many are live right now, so the ceiling above can be seen being
+// approached rather than only being hit.
+var liveConnections atomic.Int64
+
 // candidates fills dst with the healthy backends, best first, and returns the
 // filled prefix. The caller supplies the array so that choosing a backend —
 // which happens on every single request — allocates nothing.
@@ -632,6 +691,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 		return
 	case "/lb/stats":
+		used, limit, working := containerMemory()
 		// The balancer's own machine. The backends report themselves through
 		// their /stats route; without this one, Sys1 would be the one system
 		// in the deployment with no utilisation figures.
@@ -644,6 +704,17 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"hostCpuCount": runtime.NumCPU(),
 			"goroutines":   runtime.NumGoroutine(),
 			"inFlight":     lb.totalInFlight(),
+			"connections":  liveConnections.Load(),
+			"maxConns":     maxConnections,
+			"memUsedMb":    used,
+			"memLimitMb":   limit,
+			"workingSetMb": working,
+			"workingSetPercent": func() float64 {
+				if limit <= 0 {
+					return 0
+				}
+				return math.Round(float64(working)/float64(limit)*1000) / 10
+			}(),
 		})
 		return
 	}
@@ -974,6 +1045,7 @@ func (c *peekedConn) Close() error {
 	c.once.Do(func() {
 		if c.done != nil {
 			<-c.done
+			liveConnections.Add(-1)
 		}
 	})
 	return err
@@ -1080,6 +1152,7 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 
 	for {
 		live <- struct{}{}
+		liveConnections.Add(1)
 
 		conn, err := listener.Accept()
 		if err != nil {
@@ -1098,6 +1171,7 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 
 			log.Printf("accept failed (%v); retrying in %v", err, backoff)
 			<-live
+			liveConnections.Add(-1)
 			time.Sleep(backoff)
 			continue
 		}
@@ -1123,6 +1197,7 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 			if err != nil {
 				conn.Close()
 				<-live
+				liveConnections.Add(-1)
 				return
 			}
 
