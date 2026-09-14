@@ -117,6 +117,7 @@ class MessageStore extends EventEmitter {
     this.snapshots = new Array(SNAPSHOT_BUFFERS).fill(null);
     this.snapshotSkips = 0;
     this.shedding = false;
+    this.writeStats = { batches: 0, docs: 0, totalMs: 0, maxMs: 0, overASecond: 0 };
     // The newest timestamp this machine has deliberately dropped. Anything at
     // or below it must not be taken back, however insistently a peer offers it.
     this.trimmedThroughTs = 0;
@@ -221,6 +222,15 @@ class MessageStore extends EventEmitter {
       bodyCapacity: this.body.length,
       maxBytes: this.options.maxBytes,
       gzipLevel: this.options.gzipLevel,
+      writeBatches: this.writeStats.batches,
+      writeMeanMs: this.writeStats.batches
+        ? Number((this.writeStats.totalMs / this.writeStats.batches).toFixed(2))
+        : 0,
+      writeMaxMs: Number(this.writeStats.maxMs.toFixed(1)),
+      writeBatchesOverASecond: this.writeStats.overASecond,
+      writeMeanDocsPerBatch: this.writeStats.batches
+        ? Math.round(this.writeStats.docs / this.writeStats.batches)
+        : 0,
       shedding: Boolean(this.shedding),
       feedBytes: this.cache.plain.length,
       feedGzipBytes: this.cache.gzip ? this.cache.gzip.length : 0,
@@ -719,6 +729,7 @@ class MessageStore extends EventEmitter {
     this.flushing = true;
     const batch = this.pendingWrites;
     this.pendingWrites = [];
+    const startedAt = process.hrtime.bigint();
 
     try {
       await this.writeBatch(batch.map((entry) => entry.doc));
@@ -729,6 +740,18 @@ class MessageStore extends EventEmitter {
       this.dbHealthy = false;
       for (const entry of batch) entry.reject(err);
     } finally {
+      // Every request in this batch waited exactly this long before it could
+      // be answered, because a 200 here means the message is stored. The
+      // database shares one core with this process, so when it is starved the
+      // whole batch is — and that is invisible in a mean response time, which
+      // is why it is recorded separately.
+      const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      this.writeStats.batches += 1;
+      this.writeStats.docs += batch.length;
+      this.writeStats.totalMs += ms;
+      if (ms > this.writeStats.maxMs) this.writeStats.maxMs = ms;
+      if (ms > 1000) this.writeStats.overASecond += 1;
+
       this.flushing = false;
       if (this.pendingWrites.length > 0) {
         setImmediate(() => this.flushWrites());
