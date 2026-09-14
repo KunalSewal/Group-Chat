@@ -163,7 +163,18 @@ async function start() {
     });
   });
 
-  httpServer.listen(PORT, () => {
+  // Node's default listen backlog is 511. At 2,500 concurrent users arriving
+  // in a burst that queue overflows, and the connections that do not fit are
+  // not refused politely — they are dropped, so the balancer's dial times out,
+  // it counts a failure, and it retries the request somewhere else. Every one
+  // of those is latency the client sees, and enough of them become the
+  // timeouts that are the whole gap between 38,538 requests and 40,000.
+  //
+  // The kernel caps this at net.core.somaxconn regardless, so asking for more
+  // than the machine allows is harmless.
+  const BACKLOG = Number(process.env.LISTEN_BACKLOG || 4096);
+
+  httpServer.listen(PORT, BACKLOG, () => {
     console.log(
       `Chat server running on http://localhost:${PORT} ` +
         `(worker ${process.pid}, peers: ${PEERS.length})`

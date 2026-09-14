@@ -1012,12 +1012,22 @@ func main() {
 	statsInterval := flag.Duration("stats-interval", 400*time.Millisecond, "interval between backend stats polls")
 	statsTimeout := flag.Duration("stats-timeout", 1*time.Second, "timeout for a single stats poll")
 	backendTimeout := flag.Duration("backend-timeout", 15*time.Second, "how long to wait for a backend's response headers")
-	dialTimeout := flag.Duration("dial-timeout", 2*time.Second, "timeout connecting to a backend")
+	// Two seconds was short enough that a backend whose accept queue was busy
+	// counted as a backend that was down: the dial failed, the request was
+	// retried elsewhere, and the client paid for both attempts. A dial to a
+	// machine in the same rack either completes in microseconds or is queued,
+	// and being queued is not a failure.
+	dialTimeout := flag.Duration("dial-timeout", 5*time.Second, "timeout connecting to a backend")
 	threshold := flag.Float64("load-threshold", 4.0, "load score above which traffic switches to another backend")
 	wInFlight := flag.Float64("w-inflight", 1.0, "score weight for one outstanding request")
 	wLatency := flag.Float64("w-latency", 0.05, "score weight per millisecond of smoothed latency")
 	wCPU := flag.Float64("w-cpu", 0.10, "score weight per percent of backend CPU")
-	maxIdlePerHost := flag.Int("max-idle-per-host", 256, "idle keep-alive connections kept per backend")
+	// A cap on how many connections may be *kept*, not how many are opened, so
+	// raising it costs nothing until the load actually calls for them. Below the
+	// concurrency in flight it costs a great deal: every request beyond the cap
+	// closes its connection at the end and the next one dials again, which is
+	// the handshake, the accept queue and the failure modes of both, per request.
+	maxIdlePerHost := flag.Int("max-idle-per-host", 1024, "idle keep-alive connections kept per backend")
 	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
