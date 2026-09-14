@@ -90,6 +90,9 @@ a failure, which is where the reason is.
   source `~/.nvm/nvm.sh`, `~/.profile` and `~/.bashrc` to get the same one; if
   node is installed somewhere none of those put on the PATH, the log now says
   which node it used and what version.
+- **`lb exited with 1`, `set BACKENDS=...`** — the balancer was restarted
+  without being told which machines it fronts. Give them once and they are
+  remembered in `~/.lb-backends`; later restarts need nothing.
 - **`mongo exited with 48`** — something already holds port 27017, almost
   always an unsupervised `mongod --fork` left from an earlier session. Stop it
   with `pkill -x mongod` and run `bash deploy/up.sh backend --restart`. Check

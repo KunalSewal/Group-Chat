@@ -5,7 +5,29 @@
 set -eu
 source "$(dirname "$0")/env.sh"
 
-: "${BACKENDS:?set BACKENDS=http://host:port,http://host:port,...}"
+# The balancer has to remember which machines it fronts.
+#
+# BACKENDS lives in the environment of whoever started it, which is fine for
+# the first start and useless for every one after: the supervisor restarts this
+# script with its own environment, so a crash at three in the morning, or a
+# plain --restart, brought it back with no backends and it refused to start —
+# then refused again, every thirty seconds, with the cluster unreachable the
+# whole time. Given once, it is remembered.
+: "${LB_BACKENDS_FILE:=$HOME/.lb-backends}"
+
+if [ -n "${BACKENDS:-}" ]; then
+  printf "%s
+" "$BACKENDS" > "$LB_BACKENDS_FILE"
+elif [ -r "$LB_BACKENDS_FILE" ]; then
+  BACKENDS="$(cat "$LB_BACKENDS_FILE")"
+  echo "[lb] using remembered backends: $BACKENDS"
+fi
+
+if [ -z "${BACKENDS:-}" ]; then
+  echo "[lb] FATAL: no backends. Start it once with them and they are remembered:"
+  echo "[lb]   BACKENDS=http://host:3000,http://host:3000 bash deploy/up.sh lb --restart"
+  exit 78
+fi
 : "${LB_LISTEN:=:3000}"
 : "${LB_THRESHOLD:=4}"
 
