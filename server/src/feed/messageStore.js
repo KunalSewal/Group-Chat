@@ -281,6 +281,23 @@ class MessageStore extends EventEmitter {
     this.checksum = 0;
     this.dirty = true;
     this.lastPollAt = Date.now();
+
+    // Let go of the cached response before reclaiming, or the buffer it is
+    // holding a reference to survives the reclaim — and that is the largest
+    // one. Readers still writing from it keep their own reference and are
+    // unaffected; this only gives up the cache's claim.
+    if (this.cache.plainEntry) this.cache.plainEntry.refs -= 1;
+    this.cache = { plain: Buffer.from('[]'), plainEntry: null, gzip: null, count: 0, builtAt: 0 };
+
+    // An emptied conversation should cost what an empty one costs. Without
+    // this the buffers sized for the run that just finished stay allocated,
+    // and a reset between runs — which exists precisely to start clean — would
+    // leave the machine carrying the last run's peak into the next one.
+    const freed = this.releaseIdleBuffers();
+    if (freed > 0) {
+      console.log('reset released ' + Math.round(freed / 1048576) + 'MB of feed buffers');
+    }
+
     this.rebuild();
 
     return result.deletedCount ?? 0;
@@ -524,6 +541,38 @@ class MessageStore extends EventEmitter {
     return source();
   }
 
+  // Hands back buffer space the conversation no longer needs.
+  //
+  // Both of these only ever grew. A backend that once held seventy thousand
+  // messages was measured still holding a 19.5MB body buffer and its snapshots
+  // with the conversation emptied — 218MB of off-heap memory against a 48MB
+  // heap, on a 512MB machine. Every peak became the new floor, and the next
+  // peak started from there, which is how a process that survived one run gets
+  // killed during the following one.
+  releaseIdleBuffers() {
+    let freed = 0;
+
+    const comfortable = Math.max(65536, Math.ceil(this.bodyLen * 1.5));
+    if (this.body.length > comfortable * 2) {
+      const shrunk = Buffer.allocUnsafe(comfortable);
+      this.body.copy(shrunk, 0, 0, this.bodyLen);
+      freed += this.body.length - comfortable;
+      this.body = shrunk;
+    }
+
+    // Only the ones nothing is reading. A buffer still being written to a
+    // socket is exactly what the reference count exists to protect.
+    for (let i = 0; i < this.snapshots.length; i += 1) {
+      const entry = this.snapshots[i];
+      if (entry && entry.refs === 0 && entry.buf.length > comfortable * 2) {
+        freed += entry.buf.length;
+        this.snapshots[i] = null;
+      }
+    }
+
+    return freed;
+  }
+
   // Gives memory back before the kernel takes it.
   //
   // Everything in this container — this process, mongod, the page cache — is
@@ -550,9 +599,10 @@ class MessageStore extends EventEmitter {
     this.shedding = true;
     this.counters.sheds = (this.counters.sheds || 0) + 1;
 
-    // 1. The pooled snapshots nobody is reading. They are the largest thing
-    //    here that can be released without losing anything: they are rebuilt
-    //    on demand, at the cost of one allocation.
+    // 1. The pooled snapshots nobody is reading, and any slack in the live
+    //    body. They are the largest things here that can be released without
+    //    losing anything: they are rebuilt on demand, at the cost of one
+    //    allocation.
     let freed = 0;
     for (let i = 0; i < this.snapshots.length; i += 1) {
       const entry = this.snapshots[i];
@@ -561,6 +611,7 @@ class MessageStore extends EventEmitter {
         this.snapshots[i] = null;
       }
     }
+    freed += this.releaseIdleBuffers();
 
     // 2. The compressed copy. It is a convenience — clients that asked for
     //    gzip get the plain body instead until the pressure passes.
