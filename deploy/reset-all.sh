@@ -21,10 +21,43 @@ backends=("$@")
 [ "${#backends[@]}" -gt 0 ] || { echo "give at least one backend URL" >&2; exit 2; }
 
 echo "resetting ${#backends[@]} backends together"
+
+# Each answer is kept and shown. Throwing them away meant a run where every
+# reset was refused looked identical to one where every reset worked — the
+# only clue being that the counts had not moved, which is exactly the thing a
+# person running this is trusting the script to notice for them.
+tmp="$(mktemp -d)"
+i=0
 for backend in "${backends[@]}"; do
-  curl -s -m 10 -X POST "$backend/admin/reset?token=$token" -o /dev/null &
+  curl -s -m 10 -X POST "$backend/admin/reset?token=$token" -o "$tmp/$i" &
+  i=$((i + 1))
 done
 wait
+
+i=0
+refused=0
+for backend in "${backends[@]}"; do
+  answer="$(cat "$tmp/$i" 2>/dev/null)"
+  printf "  %-32s %s
+" "$backend" "${answer:-(no answer)}"
+  case "$answer" in
+    *"ok"*) ;;
+    *forbidden*) refused=1 ;;
+    *"not enabled"*) refused=1 ;;
+    *) refused=1 ;;
+  esac
+  i=$((i + 1))
+done
+rm -rf "$tmp"
+
+if [ "$refused" -ne 0 ]; then
+  echo
+  echo "FAIL: at least one backend refused the reset. "forbidden" means the"
+  echo "      token did not match — pass the real value of ADMIN_TOKEN from"
+  echo "      server/.env, not a placeholder. "not enabled" means that machine"
+  echo "      has no ADMIN_TOKEN set at all."
+  exit 1
+fi
 
 count_of() {
   curl -s -m 10 "$1/stats" |
