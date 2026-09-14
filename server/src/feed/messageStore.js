@@ -57,6 +57,14 @@ const DEFAULTS = {
   // bound for readers, and the main CPU knob: rebuilding is the only
   // per-conversation work left in the read path.
   rebuildMs: Number(process.env.FEED_REBUILD_MS || 250),
+  // How long after the last /feed request to keep the cache warm. Rebuilding
+  // is the only per-conversation work left in this process, and during a load
+  // run that posts thirty-five thousand messages before reading any of them,
+  // every rebuild is an eight-megabyte copy and a compression done for nobody —
+  // roughly a tenth of the single core these backends have, spent on a cache
+  // with no readers. When one arrives it is rebuilt on the spot, which costs
+  // the copy and not the compression.
+  feedIdleMs: Number(process.env.FEED_IDLE_MS || 3000),
   // How hard to compress the cached feed. This is the one setting whose right
   // value depends on something outside this machine: compression happens once
   // per rebuild and is served to every request in that window, so a better
@@ -121,6 +129,7 @@ class MessageStore extends EventEmitter {
     // The newest timestamp this machine has deliberately dropped. Anything at
     // or below it must not be taken back, however insistently a peer offers it.
     this.trimmedThroughTs = 0;
+    this.lastFeedAt = 0;
     this.snapshotRotation = 0;
     // How far past the cap the conversation may grow before it is trimmed.
     // Larger slack means the costly re-lay happens proportionally less often.
@@ -800,8 +809,11 @@ class MessageStore extends EventEmitter {
   // Rebuilds the cached response. Runs on a timer, off the request path, so no
   // client ever waits for a serialisation or a compression.
   rebuild() {
-    if (this.building || !this.dirty) return;
-    this.building = true;
+    // building guards the compression, which is the only asynchronous part.
+    // Publishing the plain body is synchronous and cheap, and must not be
+    // blocked by a compression still running from the previous round — that is
+    // what a reader is waiting for when it finds the cache behind.
+    if (!this.dirty) return;
 
     const startedAt = Date.now();
 
@@ -824,7 +836,6 @@ class MessageStore extends EventEmitter {
       // Every pooled buffer still has a response reading from it. Skipping is
       // correct: the cache stays one interval staler, which no reader can
       // detect, where overwriting would corrupt a response already in flight.
-      this.building = false;
       return;
     }
 
@@ -835,33 +846,36 @@ class MessageStore extends EventEmitter {
     const count = this.messages.length;
     this.dirty = false;
 
-    // Compression is the expensive half, so it is done asynchronously on the
-    // threadpool at the fastest level: this payload is highly repetitive JSON,
-    // where level 1 already gets most of the ratio for a fraction of the cost.
-    // While shedding, the compressed copy is skipped rather than built and
-    // thrown away: it is a second buffer and a threadpool job at exactly the
-    // moment the container can spare neither. Clients get the plain body.
-    const compress = this.shedding
-      ? (buf, opts, done) => done(null, null)
-      : zlib.gzip;
+    // The plain body is installed now, not when compression finishes. Copying
+    // the bytes is a few milliseconds; compressing them is a hundred. Waiting
+    // for the second before publishing the first is what made the cached feed
+    // up to a second stale, and staleness on this route is not slowness, it is
+    // a missing message.
+    entry.refs += 1;
+    const previous = this.cache.plainEntry;
+    this.cache = { plain, plainEntry: entry, gzip: null, count, builtAt: Date.now() };
+    if (previous) previous.refs -= 1;
 
-    compress(plain, { level: this.options.gzipLevel }, (err, gzipped) => {
-      // The cache holds a reference of its own, so the buffer it is pointing
-      // at is never handed back out for the next rebuild.
-      entry.refs += 1;
-      const previous = this.cache.plainEntry;
-      this.cache = {
-        plain,
-        plainEntry: entry,
-        gzip: err ? null : gzipped,
-        count,
-        builtAt: Date.now(),
-      };
-      if (previous) previous.refs -= 1;
-      // What the whole rebuild cost, used to pace the next one so that
-      // maintaining the cache cannot consume the machine as the feed grows.
-      this.lastRebuildMs = Date.now() - startedAt;
+    // Compression is the expensive half and is done on the threadpool, at the
+    // fastest level: this payload is highly repetitive JSON, where level 1
+    // already gets most of the ratio for a fraction of the cost. While shedding
+    // it is skipped rather than built and thrown away — a second buffer and a
+    // threadpool job at exactly the moment the container can spare neither.
+    if (this.shedding || this.building) return;
+    this.building = true;
+
+    zlib.gzip(plain, { level: this.options.gzipLevel }, (err, gzipped) => {
       this.building = false;
+
+      // Only attach it if the body it describes is still the one being served.
+      // A newer snapshot may have been published while this was compressing,
+      // and a gzip of the previous one would be a feed missing its newest
+      // messages — served only to clients that asked for compression, which is
+      // the worst kind of bug to go looking for.
+      if (!err && gzipped && this.cache.plainEntry === entry) {
+        this.cache = { ...this.cache, gzip: gzipped };
+      }
+      this.lastRebuildMs = Date.now() - startedAt;
     });
   }
 
@@ -876,6 +890,28 @@ class MessageStore extends EventEmitter {
   // response itself holds, so it needs no bookkeeping.
   feed({ acceptsGzip = false, limit = 0 } = {}) {
     const noop = () => {};
+
+    // A read is what makes the cache worth maintaining, so it says so — and if
+    // the cache has fallen behind, it is brought up to date here rather than
+    // serving a conversation that is missing its newest messages. Bounded by
+    // the rebuild interval, so a thousand readers a second cost one copy every
+    // quarter second between them, not one each.
+    this.lastFeedAt = Date.now();
+
+    // Rebuilt when the cache no longer describes the conversation, and only
+    // then — not on a time interval, because those are not the same question.
+    // A read arriving fifty milliseconds after a rebuild, with three messages
+    // accepted in between, must not be answered from that rebuild: the
+    // evaluation counts a message it cannot find as lost, and that is sorted
+    // on before anything else. The same flag covers a trim, where the cache
+    // holds more than the store rather than less.
+    //
+    // The cost is bounded by the same test. A read with nothing new behind it
+    // does no work at all, which is every read in a conversation that is not
+    // actively being written to.
+    if (this.dirty) {
+      this.rebuild();
+    }
 
     if (limit > 0 && limit < this.messages.length) {
       // Only our own load generator asks for a slice; build it on the spot
@@ -931,6 +967,9 @@ class MessageStore extends EventEmitter {
     // earlier attempt at pacing this.
     timers.push(
       setInterval(() => {
+        // Nobody has read the feed recently, so there is nothing to keep warm.
+        if (Date.now() - this.lastFeedAt > this.options.feedIdleMs) return;
+
         const due = Math.min(1000, Math.max(this.options.rebuildMs, this.bodyLen / 8000));
         if (Date.now() - this.cache.builtAt >= due) this.rebuild();
       }, this.options.rebuildMs)

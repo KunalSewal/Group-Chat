@@ -101,6 +101,11 @@ func (t *timedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return response, err
 }
 
+// Service time as the backend itself measures it, in milliseconds.
+func (b *Backend) BackendLatencyMs() float64 {
+	return float64(b.backendEwma.Load()) / 1000.0
+}
+
 func (b *Backend) observe(d time.Duration) {
 	const alpha = 0.2
 	previous := b.ewmaMicros.Load()
@@ -442,9 +447,28 @@ func (lb *LoadBalancer) SetThreshold(v float64) {
 	lb.threshold.Store(math.Float64bits(v))
 }
 
+// What the balancer routes on.
+//
+// In-flight is the term that matters, and the latency term exists to break ties
+// between backends carrying the same number of requests. Which latency is used
+// decides whether this is stable.
+//
+// Not the time this balancer measured, which includes streaming the response to
+// the client: a slow reader would make a healthy backend look overloaded. And
+// not even the corrected proxy-side measurement, which is real but lags — under
+// load the three backends measured 585, 901 and 2504ms, so at a weight of 0.05
+// the latency term reached 125 points against an in-flight term in the tens.
+// Traffic then stampedes to whichever backend last looked fastest, overloads
+// it, and stampedes back. That oscillation took the error rate at 2,500 users
+// to 29.9% and broke the ladder.
+//
+// The backend's own smoothed service time is the honest signal: it is measured
+// where the work happens, it excludes every client, and it stays in the tens of
+// milliseconds — so it orders equally-loaded backends without ever overruling
+// the count of requests they are actually carrying.
 func (lb *LoadBalancer) score(b *Backend) float64 {
 	return lb.weights.InFlight*float64(b.InFlight.Load()) +
-		lb.weights.Latency*b.LatencyMs() +
+		lb.weights.Latency*b.BackendLatencyMs() +
 		lb.weights.CPU*b.CPUPercent()
 }
 
@@ -462,13 +486,15 @@ var failureThreshold int64 = 5
 
 // How long one proxied request may take in total.
 //
-// Twenty seconds is already far longer than any client here waits: the
-// evaluation harness gives up at around ten. Past that point the request is
-// being carried for nobody — and it still holds a goroutine, a connection to
-// the backend and both their buffers, at exactly the moment the queue is
-// deepest and those are worth the most. Sixty seconds meant fifty of them
-// spent serving an audience that had left.
-var requestDeadline = 20 * time.Second
+// Sixty seconds, which is the value both of the runs that held the full ladder
+// were using. Twenty looked better in principle — the client gives up long
+// before that, and the request is then being carried for nobody — but measured
+// it was worse in a way the principle did not predict: a slow request that
+// would have completed became an error instead, the error rate at 2,500 users
+// went from 5% to 30%, and the run was recorded as broken rather than slow.
+// This is a backstop against a request that will never finish, not a
+// service-level target, and it should be set where it only catches those.
+var requestDeadline = 60 * time.Second
 
 // candidates fills dst with the healthy backends, best first, and returns the
 // filled prefix. The caller supplies the array so that choosing a backend —
@@ -1073,7 +1099,7 @@ func main() {
 	// concurrency in flight it costs a great deal: every request beyond the cap
 	// closes its connection at the end and the next one dials again, which is
 	// the handshake, the accept queue and the failure modes of both, per request.
-	maxIdlePerHost := flag.Int("max-idle-per-host", 512, "idle keep-alive connections kept per backend")
+	maxIdlePerHost := flag.Int("max-idle-per-host", 1024, "idle keep-alive connections kept per backend")
 	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")

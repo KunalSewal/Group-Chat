@@ -17,7 +17,14 @@
 // disagree.
 
 const DEFAULTS = {
-  intervalMs: Number(process.env.RECONCILE_INTERVAL_MS || 10000),
+  // Thirty seconds, not ten. Comparing two machines that disagree means
+  // fetching a list of every id the peer holds — at thirty-five thousand
+  // messages that is a megabyte of JSON to build on one side and parse on the
+  // other, on the single core both are also serving requests with. Replication
+  // already delivers everything within tens of milliseconds; this exists to
+  // repair what a peer missed while it was unreachable, and that does not need
+  // checking three times a minute.
+  intervalMs: Number(process.env.RECONCILE_INTERVAL_MS || 30000),
   // Cap on how much repair happens in one round, so catching up a machine that
   // missed a lot never turns into one enormous request.
   batchSize: Number(process.env.RECONCILE_BATCH || 2000),
