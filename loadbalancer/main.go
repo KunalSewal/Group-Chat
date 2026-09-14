@@ -586,6 +586,23 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
 		defer cancel()
 		r = r.WithContext(ctx)
+
+		// The context alone is not enough, which one run made plain: fifty-one
+		// requests were still in flight two minutes after their clients had gone,
+		// with a sixty-second deadline set on every one of them.
+		//
+		// A cancelled context stops the proxy between copies. It cannot interrupt
+		// a write already blocked in the kernel, and that is where these were:
+		// writing a two-megabyte feed to a client that had stopped reading, into a
+		// 32KB socket buffer that filled and never drained. Only a deadline on the
+		// socket itself ends that.
+		//
+		// Cleared on the way out, because the connection is reused and a deadline
+		// left behind would expire in the middle of somebody else's response.
+		rc := http.NewResponseController(w)
+		if err := rc.SetWriteDeadline(time.Now().Add(requestDeadline)); err == nil {
+			defer rc.SetWriteDeadline(time.Time{})
+		}
 	}
 
 	var bodyBytes []byte
@@ -729,6 +746,11 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		return nil, nil, errors.New("underlying ResponseWriter does not support hijacking")
 	}
 	return hj.Hijack()
+}
+
+// Lets http.ResponseController reach the real connection through this wrapper.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 func (r *statusRecorder) Flush() {
