@@ -11,3 +11,7 @@ loadgen/loadgen.exe
 loadgen/results/
 loadbalancer/lb
 loadbalancer/lb.exe
+
+# Local TLS material for the demo — never committed
+loadbalancer/lb.crt
+loadbalancer/lb.key

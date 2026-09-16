@@ -40,4 +40,21 @@ if [ ! -x ./lb ] || [ main.go -nt ./lb ]; then
   go build -o lb .
 fi
 
-exec ./lb -backends "$BACKENDS" -listen "$LB_LISTEN" -load-threshold "$LB_THRESHOLD" ${LB_EXTRA_ARGS:-}
+# TLS, if a certificate is sitting next to the binary.
+#
+# The evaluation harness submits a plain http:// URL, while the chat client in
+# a browser needs https:// — without a secure context there is no WebCrypto, so
+# no signing key, so no login. Each machine publishes exactly one port, so both
+# have to arrive on it, which the balancer handles by looking at the first byte
+# of each connection: 0x16 is a TLS handshake, anything else is HTTP.
+#
+# Detected from the filesystem rather than passed in, because anything passed
+# in is lost the moment the supervisor restarts this script with its own
+# environment — which is how the balancer once came back with no backends.
+tls=""
+if [ -r ./lb.crt ] && [ -r ./lb.key ]; then
+  tls="-tls-cert ./lb.crt -tls-key ./lb.key"
+  echo "[lb] serving HTTPS and HTTP on the same port (found ./lb.crt)"
+fi
+
+exec ./lb -backends "$BACKENDS" -listen "$LB_LISTEN" -load-threshold "$LB_THRESHOLD" $tls ${LB_EXTRA_ARGS:-}
